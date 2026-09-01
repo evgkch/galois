@@ -956,11 +956,14 @@ void main() { gl_Position = vec4(aPos, 0.0, 1.0); }
 const TM_FS = `
 precision mediump float;
 uniform sampler2D uTex;
+uniform sampler2D uExt;
 uniform vec2 uInvSize;
 uniform float uExposure;
+uniform float uExtOn;
 uniform vec3 uBg;
 void main() {
-  vec3 c = texture2D(uTex, gl_FragCoord.xy * uInvSize).rgb;
+  vec2 uv = gl_FragCoord.xy * uInvSize;
+  vec3 c = texture2D(uTex, uv).rgb + texture2D(uExt, uv).rgb * uExtOn;
   gl_FragColor = vec4(uBg + (1.0 - exp(-c * uExposure)), 1.0);
 }
 `;
@@ -968,46 +971,69 @@ void main() {
 let tmProg: WebGLProgram | null = null;
 let locTmPos = 0;
 let locTmTex: WebGLUniformLocation | null = null;
+let locTmExt: WebGLUniformLocation | null = null;
 let locTmInv: WebGLUniformLocation | null = null;
 let locTmExp: WebGLUniformLocation | null = null;
+let locTmExtOn: WebGLUniformLocation | null = null;
 let locTmBg: WebGLUniformLocation | null = null;
 let quadBuf: WebGLBuffer | null = null;
 let fbo: WebGLFramebuffer | null = null;
 let fboTex: WebGLTexture | null = null;
 let fboW = 0;
 let fboH = 0;
+// Chord extensions accumulate in a separate half-size target: they are the
+// long faint lines, and their fill cost scales with the target area.
+let extFbo: WebGLFramebuffer | null = null;
+let extTex: WebGLTexture | null = null;
+let extW = 0;
+let extH = 0;
+let halfExt = false;
 
 if (post && gl2) {
   tmProg = createProgram(gl2, TM_VS, TM_FS);
   locTmPos = gl2.getAttribLocation(tmProg, 'aPos');
   locTmTex = gl2.getUniformLocation(tmProg, 'uTex');
+  locTmExt = gl2.getUniformLocation(tmProg, 'uExt');
   locTmInv = gl2.getUniformLocation(tmProg, 'uInvSize');
   locTmExp = gl2.getUniformLocation(tmProg, 'uExposure');
+  locTmExtOn = gl2.getUniformLocation(tmProg, 'uExtOn');
   locTmBg = gl2.getUniformLocation(tmProg, 'uBg');
   quadBuf = gl2.createBuffer();
   gl2.bindBuffer(gl2.ARRAY_BUFFER, quadBuf);
   gl2.bufferData(gl2.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl2.STATIC_DRAW);
   fbo = gl2.createFramebuffer();
   fboTex = gl2.createTexture();
+  extFbo = gl2.createFramebuffer();
+  extTex = gl2.createTexture();
+}
+
+// (Re)allocates a linear-filtered RGBA16F texture of the given size as the
+// framebuffer's color attachment; false when the combination is unsupported.
+function attachFloatTarget(fb: WebGLFramebuffer | null, tex: WebGLTexture | null, w: number, h: number): boolean {
+  const g = gl2!;
+  g.bindTexture(g.TEXTURE_2D, tex);
+  g.texParameteri(g.TEXTURE_2D, g.TEXTURE_MIN_FILTER, g.LINEAR);
+  g.texParameteri(g.TEXTURE_2D, g.TEXTURE_MAG_FILTER, g.LINEAR);
+  g.texParameteri(g.TEXTURE_2D, g.TEXTURE_WRAP_S, g.CLAMP_TO_EDGE);
+  g.texParameteri(g.TEXTURE_2D, g.TEXTURE_WRAP_T, g.CLAMP_TO_EDGE);
+  g.texImage2D(g.TEXTURE_2D, 0, g.RGBA16F, w, h, 0, g.RGBA, g.HALF_FLOAT, null);
+  g.bindFramebuffer(g.FRAMEBUFFER, fb);
+  g.framebufferTexture2D(g.FRAMEBUFFER, g.COLOR_ATTACHMENT0, g.TEXTURE_2D, tex, 0);
+  const ok = g.checkFramebufferStatus(g.FRAMEBUFFER) === g.FRAMEBUFFER_COMPLETE;
+  g.bindFramebuffer(g.FRAMEBUFFER, null);
+  return ok;
 }
 
 function ensureFbo(w: number, h: number): boolean {
   if (!post || !gl2) return false;
   if (fboW === w && fboH === h) return true;
-  gl2.bindTexture(gl2.TEXTURE_2D, fboTex);
-  gl2.texParameteri(gl2.TEXTURE_2D, gl2.TEXTURE_MIN_FILTER, gl2.LINEAR);
-  gl2.texParameteri(gl2.TEXTURE_2D, gl2.TEXTURE_MAG_FILTER, gl2.LINEAR);
-  gl2.texParameteri(gl2.TEXTURE_2D, gl2.TEXTURE_WRAP_S, gl2.CLAMP_TO_EDGE);
-  gl2.texParameteri(gl2.TEXTURE_2D, gl2.TEXTURE_WRAP_T, gl2.CLAMP_TO_EDGE);
-  gl2.texImage2D(gl2.TEXTURE_2D, 0, gl2.RGBA16F, w, h, 0, gl2.RGBA, gl2.HALF_FLOAT, null);
-  gl2.bindFramebuffer(gl2.FRAMEBUFFER, fbo);
-  gl2.framebufferTexture2D(gl2.FRAMEBUFFER, gl2.COLOR_ATTACHMENT0, gl2.TEXTURE_2D, fboTex, 0);
-  const ok = gl2.checkFramebufferStatus(gl2.FRAMEBUFFER) === gl2.FRAMEBUFFER_COMPLETE;
-  gl2.bindFramebuffer(gl2.FRAMEBUFFER, null);
-  if (!ok) {
+  if (!attachFloatTarget(fbo, fboTex, w, h)) {
     post = false;
     return false;
   }
+  extW = Math.ceil(w / 2);
+  extH = Math.ceil(h / 2);
+  halfExt = attachFloatTarget(extFbo, extTex, extW, extH);
   fboW = w;
   fboH = h;
   return true;
@@ -1505,38 +1531,20 @@ function draw() {
   // instead and the linear-filtered tone-map pass box-downsamples.
   const ss = post && dpr < 1.5 ? 2 : 1;
   const usePost = ensureFbo(w * ss, h * ss);
-
-  if (usePost && gl2) {
-    gl2.bindFramebuffer(gl2.FRAMEBUFFER, fbo);
-    gl.viewport(0, 0, w * ss, h * ss);
-    gl.clearColor(0, 0, 0, 1); // the background is added after tone mapping
-  } else {
-    gl.viewport(0, 0, w, h);
-    gl.clearColor(0.039, 0.047, 0.063, 1);
-  }
-  gl.clear(gl.COLOR_BUFFER_BIT);
-
-  gl.useProgram(prog);
   const flat = state.mode === 'fp' || state.layout === 'log';
-  gl.uniformMatrix3fv(locRot, false, flat ? IDENT3 : rot);
-  gl.uniform2f(locScale, (m / w) * state.zoom, (m / h) * state.zoom);
-  gl.uniform2f(locOffset, offX, 0);
-  gl.uniform1f(locDist, CAM_DIST);
-  gl.uniform1f(locPoint, 0);
 
   // Without the tone map the glow control falls back to scaling alpha.
   const alphaMul = usePost ? 1 : state.exposure;
-
-  if (flat) {
-    bindAttribs(circleBuf);
-    gl.uniform1f(locAlpha, 1);
-    gl.drawArrays(gl.LINE_LOOP, 0, CIRCLE_SEG);
-  }
 
   const chordAlpha =
     (state.mode === 'fp'
       ? Math.min(0.8, 0.12 + 30 / state.p)
       : Math.min(0.45, 0.025 + 7 / state.p2)) * alphaMul;
+
+  const t = phase();
+  const passes: Array<[WebGLBuffer, number]> = endsBLive
+    ? [[endBufA, 1 - t], [endBufB, t]]
+    : [[endBufA, 1]];
 
   // Chords and extensions draw instanced; the extension geometry comes out
   // of the vertex shader, so a fade pass only rebinds the end buffer.
@@ -1560,14 +1568,37 @@ function draw() {
   gl.enableVertexAttribArray(locEnd);
   setDivisor(locEnd, 1);
 
-  const t = phase();
-  const passes: Array<[WebGLBuffer, number]> = endsBLive
-    ? [[endBufA, 1 - t], [endBufB, t]]
-    : [[endBufA, 1]];
+  // Extensions render into the half-size target. Its 1-px line is twice as
+  // wide after the linear upsample, so the alpha is halved to keep the
+  // accumulated brightness of the full-size line.
+  const extHalf = usePost && halfExt && state.showExt;
+  if (extHalf && gl2) {
+    gl2.bindFramebuffer(gl2.FRAMEBUFFER, extFbo);
+    gl.viewport(0, 0, extW, extH);
+    gl.clearColor(0, 0, 0, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    for (const [buf, weight] of passes) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+      gl.vertexAttribPointer(locEnd, 3, gl.FLOAT, false, 0, 0);
+      gl.uniform1f(locLAlpha, chordAlpha * 0.45 * 0.5 * weight);
+      drawInstanced(2, 4);
+    }
+  }
+
+  if (usePost && gl2) {
+    gl2.bindFramebuffer(gl2.FRAMEBUFFER, fbo);
+    gl.viewport(0, 0, w * ss, h * ss);
+    gl.clearColor(0, 0, 0, 1); // the background is added after tone mapping
+  } else {
+    gl.viewport(0, 0, w, h);
+    gl.clearColor(0.039, 0.047, 0.063, 1);
+  }
+  gl.clear(gl.COLOR_BUFFER_BIT);
+
   for (const [buf, weight] of passes) {
     gl.bindBuffer(gl.ARRAY_BUFFER, buf);
     gl.vertexAttribPointer(locEnd, 3, gl.FLOAT, false, 0, 0);
-    if (state.showExt) {
+    if (state.showExt && !extHalf) {
       gl.uniform1f(locLAlpha, chordAlpha * 0.45 * weight);
       drawInstanced(2, 4);
     }
@@ -1586,6 +1617,17 @@ function draw() {
   gl.enableVertexAttribArray(locPos);
   gl.enableVertexAttribArray(locColor);
   gl.useProgram(prog);
+  gl.uniformMatrix3fv(locRot, false, flat ? IDENT3 : rot);
+  gl.uniform2f(locScale, (m / w) * state.zoom, (m / h) * state.zoom);
+  gl.uniform2f(locOffset, offX, 0);
+  gl.uniform1f(locDist, CAM_DIST);
+  gl.uniform1f(locPoint, 0);
+
+  if (flat) {
+    bindAttribs(circleBuf);
+    gl.uniform1f(locAlpha, 1);
+    gl.drawArrays(gl.LINE_LOOP, 0, CIRCLE_SEG);
+  }
 
   if (state.showPoints) {
     bindAttribs(pointBuf);
@@ -1607,6 +1649,10 @@ function draw() {
     gl2.viewport(0, 0, w, h);
     gl2.disable(gl2.BLEND);
     gl2.useProgram(tmProg);
+    gl2.activeTexture(gl2.TEXTURE1);
+    gl2.bindTexture(gl2.TEXTURE_2D, extTex);
+    gl2.uniform1i(locTmExt, 1);
+    gl2.uniform1f(locTmExtOn, extHalf ? 1 : 0);
     gl2.activeTexture(gl2.TEXTURE0);
     gl2.bindTexture(gl2.TEXTURE_2D, fboTex);
     gl2.uniform1i(locTmTex, 0);
