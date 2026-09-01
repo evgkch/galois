@@ -1,9 +1,10 @@
 // Arithmetic mod p. Intermediate products never exceed p², so double
 // precision is sufficient for p ≤ 20011.
 
+// The double-mod form also normalizes −0 (a bare `n % p` returns −0 for
+// n = −0, which survives equality checks but leaks into serialization).
 export function mod(n: number, p: number): number {
-  const r = n % p;
-  return r < 0 ? r + p : r;
+  return ((n % p) + p) % p;
 }
 
 export function isPrime(n: number): boolean {
