@@ -636,7 +636,6 @@ ui.rx.on(':speed', (value) => {
 
 ui.rx.on(':view', (key, value) => {
   state[key] = value;
-  if (key === 'showExt') dirty = true; // extensions are built only while shown
   invalidate();
   syncPanel();
 });
@@ -870,6 +869,75 @@ const locAlpha = gl.getUniformLocation(prog, 'uAlpha');
 const locSize = gl.getUniformLocation(prog, 'uPointSize');
 const locPoint = gl.getUniformLocation(prog, 'uPoint');
 
+// Chord pass: instanced lines. Per-instance attributes carry the chord's
+// start, end and color; a per-vertex role template selects which of the six
+// chord/extension vertices the shader emits, so extension geometry and the
+// static halves of the data never touch the CPU after setup.
+const LINE_VS = `
+attribute float aRole;
+attribute vec3 aStart;
+attribute vec3 aEnd;
+attribute vec3 aColorI;
+uniform mat3 uRot;
+uniform vec2 uScale;
+uniform vec2 uOffset;
+uniform float uDist;
+uniform float uROut;
+varying vec3 vColor;
+
+float rayOut(vec3 pnt, vec3 dir) {
+  float pu = dot(pnt, dir);
+  return -pu + sqrt(max(pu * pu + uROut * uROut - dot(pnt, pnt), 0.0));
+}
+
+void main() {
+  vec3 d = aEnd - aStart;
+  float len = length(d);
+  vec3 pos = aStart;
+  if (len > 1e-6) {
+    if (aRole < 0.5) pos = aStart;
+    else if (aRole < 1.5) pos = aEnd;
+    else {
+      vec3 u = d / len;
+      if (aRole < 2.5) pos = aStart;
+      else if (aRole < 3.5) pos = aStart - u * rayOut(aStart, -u);
+      else if (aRole < 4.5) pos = aEnd;
+      else pos = aEnd + u * rayOut(aEnd, u);
+    }
+  }
+  vec3 v = uRot * pos;
+  float w = (uDist - v.z) / uDist;
+  gl_Position = vec4(v.xy * uScale + uOffset * w, 0.0, w);
+  vColor = aColorI;
+}
+`;
+
+const lineProg = createProgram(gl, LINE_VS, FS);
+const locRole = gl.getAttribLocation(lineProg, 'aRole');
+const locStart = gl.getAttribLocation(lineProg, 'aStart');
+const locEnd = gl.getAttribLocation(lineProg, 'aEnd');
+const locColI = gl.getAttribLocation(lineProg, 'aColorI');
+const locLRot = gl.getUniformLocation(lineProg, 'uRot');
+const locLScale = gl.getUniformLocation(lineProg, 'uScale');
+const locLOffset = gl.getUniformLocation(lineProg, 'uOffset');
+const locLDist = gl.getUniformLocation(lineProg, 'uDist');
+const locLROut = gl.getUniformLocation(lineProg, 'uROut');
+const locLAlpha = gl.getUniformLocation(lineProg, 'uAlpha');
+
+const instAngle = gl2 ? null : gl.getExtension('ANGLE_instanced_arrays');
+if (!gl2 && !instAngle) throw new Error('instanced rendering is not available');
+let nInst = 0;
+
+function setDivisor(loc: number, d: number) {
+  if (gl2) gl2.vertexAttribDivisor(loc, d);
+  else instAngle!.vertexAttribDivisorANGLE(loc, d);
+}
+
+function drawInstanced(first: number, nVerts: number) {
+  if (gl2) gl2.drawArraysInstanced(gl.LINES, first, nVerts, nInst);
+  else instAngle!.drawArraysInstancedANGLE(gl.LINES, first, nVerts, nInst);
+}
+
 gl.enableVertexAttribArray(locPos);
 gl.enableVertexAttribArray(locColor);
 gl.disable(gl.DEPTH_TEST);
@@ -945,12 +1013,18 @@ function ensureFbo(w: number, h: number): boolean {
   return true;
 }
 
-const chordBuf = gl.createBuffer()!;
-const chordBuf2 = gl.createBuffer()!;
-const extBuf = gl.createBuffer()!;
-const extBuf2 = gl.createBuffer()!;
+const roleBuf = gl.createBuffer()!;
+const startBuf = gl.createBuffer()!;
+const colorBuf = gl.createBuffer()!;
+const endBufA = gl.createBuffer()!;
+const endBufB = gl.createBuffer()!;
 const pointBuf = gl.createBuffer()!;
 const circleBuf = gl.createBuffer()!;
+
+// Vertex roles: [0,1] — the chord's two ends; [2..5] — the four extension
+// vertices. Instanced draws read a 2- or 4-vertex slice of this template.
+gl.bindBuffer(gl.ARRAY_BUFFER, roleBuf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0, 1, 2, 3, 4, 5]), gl.STATIC_DRAW);
 
 const R = 0.92;
 const R_OUT = 30.0; // extensions stay longer than the viewport even at minimum zoom
@@ -1065,23 +1139,20 @@ function f2color(x: number, y: number, p: number): [number, number, number] {
   return [r * v, g * v, b * v];
 }
 
-let chordData = new Float32Array(0);
-let extData = new Float32Array(0);
-let chordVerts = 0;
-let extVerts = 0;
-let chordVerts2 = 0;
-let extVerts2 = 0;
 let posTab = new Float32Array(0); // element positions, ·3 (fp: by x; fp2: by x·p+y)
 let colTab = new Float32Array(0); // element colors, same indexing
+let endsA = new Float32Array(0); // chord end positions, ·3 per element
+let endsB = new Float32Array(0); // the second diagram of a cross-fade
+let endsBLive = false;
 
 function reallocBuffers() {
-  if (state.mode === 'fp') {
-    chordData = new Float32Array(state.p * 12);
-    extData = new Float32Array(state.p * 24);
-  } else {
-    chordData = new Float32Array(state.p2 * state.p2 * 12);
-    extData = new Float32Array(state.p2 * state.p2 * 24);
-  }
+  nInst = state.mode === 'fp' ? state.p : state.p2 * state.p2;
+  endsA = new Float32Array(nInst * 3);
+  endsB = new Float32Array(nInst * 3);
+  gl.bindBuffer(gl.ARRAY_BUFFER, endBufA);
+  gl.bufferData(gl.ARRAY_BUFFER, endsA.byteLength, gl.DYNAMIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER, endBufB);
+  gl.bufferData(gl.ARRAY_BUFFER, endsB.byteLength, gl.DYNAMIC_DRAW);
 }
 
 let pointCount = 0;
@@ -1119,6 +1190,7 @@ function rebuildPoints() {
     pointCount = p;
     gl.bindBuffer(gl.ARRAY_BUFFER, pointBuf);
     gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+    uploadInstanceStatics();
     return;
   }
   const p = state.p2;
@@ -1156,21 +1228,16 @@ function rebuildPoints() {
   pointCount = n;
   gl.bindBuffer(gl.ARRAY_BUFFER, pointBuf);
   gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+  uploadInstanceStatics();
 }
 
-// Distance from a point inside the R_OUT sphere to its surface along a unit
-// direction: the positive root of |P + t·u| = R_OUT.
-function rayOut3(
-  px: number,
-  py: number,
-  pz: number,
-  ux: number,
-  uy: number,
-  uz: number,
-): number {
-  const pu = px * ux + py * uy + pz * uz;
-  const pp = px * px + py * py + pz * pz;
-  return -pu + Math.sqrt(pu * pu + R_OUT * R_OUT - pp);
+// Chord starts and colors are the elements' own positions and colors: they
+// change only with p, mode or layout, never per frame.
+function uploadInstanceStatics() {
+  gl.bindBuffer(gl.ARRAY_BUFFER, startBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, posTab, gl.STATIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER, colorBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, colTab, gl.STATIC_DRAW);
 }
 
 // ---------- next-step coefficient sets ----------
@@ -1226,112 +1293,62 @@ function nextSetFp2(): Fp2Set {
   };
 }
 
-// ---------- chord builders ----------
-// Each builder fills the scratch arrays for one (setA → setB, t) pass and
-// uploads them into the given GL buffers, returning vertex counts.
+// ---------- chord end positions ----------
+// The start of every chord is the element's own static position; the CPU
+// recomputes only the 3-float end per element each frame. A pole or a fixed
+// point gets end = start: the zero-length chord and its extensions rasterize
+// nothing.
 
-function uploadInto(cBuf: WebGLBuffer, eBuf: WebGLBuffer, n: number, e: number): [number, number] {
-  gl.bindBuffer(gl.ARRAY_BUFFER, cBuf);
-  gl.bufferData(gl.ARRAY_BUFFER, chordData.subarray(0, n * 12), gl.DYNAMIC_DRAW);
-  gl.bindBuffer(gl.ARRAY_BUFFER, eBuf);
-  gl.bufferData(gl.ARRAY_BUFFER, extData.subarray(0, e * 24), gl.DYNAMIC_DRAW);
-  return [n * 2, e * 4];
+function phase(): number {
+  return animValue - Math.floor(animValue);
 }
 
-function writeChord(
-  n: number,
-  sx: number, sy: number, sz: number,
-  ex: number, ey: number, ez: number,
-  r: number, g: number, b: number,
-): void {
-  const o = n * 12;
-  const cd = chordData;
-  cd[o] = sx; cd[o + 1] = sy; cd[o + 2] = sz;
-  cd[o + 3] = r; cd[o + 4] = g; cd[o + 5] = b;
-  cd[o + 6] = ex; cd[o + 7] = ey; cd[o + 8] = ez;
-  cd[o + 9] = r; cd[o + 10] = g; cd[o + 11] = b;
-}
-
-function writeExt(
-  e: number,
-  sx: number, sy: number, sz: number,
-  ex: number, ey: number, ez: number,
-  r: number, g: number, b: number,
-): boolean {
-  const dx = ex - sx;
-  const dy = ey - sy;
-  const dz = ez - sz;
-  const len = Math.sqrt(dx * dx + dy * dy + dz * dz);
-  if (len < 1e-6) return false;
-  const ux = dx / len;
-  const uy = dy / len;
-  const uz = dz / len;
-  const t0 = rayOut3(sx, sy, sz, -ux, -uy, -uz);
-  const t1 = rayOut3(ex, ey, ez, ux, uy, uz);
-  const o = e * 24;
-  const ed = extData;
-  ed[o] = sx; ed[o + 1] = sy; ed[o + 2] = sz;
-  ed[o + 3] = r; ed[o + 4] = g; ed[o + 5] = b;
-  ed[o + 6] = sx - ux * t0; ed[o + 7] = sy - uy * t0; ed[o + 8] = sz - uz * t0;
-  ed[o + 9] = r; ed[o + 10] = g; ed[o + 11] = b;
-  ed[o + 12] = ex; ed[o + 13] = ey; ed[o + 14] = ez;
-  ed[o + 15] = r; ed[o + 16] = g; ed[o + 17] = b;
-  ed[o + 18] = ex + ux * t1; ed[o + 19] = ey + uy * t1; ed[o + 20] = ez + uz * t1;
-  ed[o + 21] = r; ed[o + 22] = g; ed[o + 23] = b;
-  return true;
-}
-
-function buildFp(setA: FpSet, setB: FpSet, t: number, cBuf: WebGLBuffer, eBuf: WebGLBuffer): [number, number] {
+function fillEndsFp(setA: FpSet, setB: FpSet, t: number, out: Float32Array) {
   const p = state.p;
   const log = state.layout === 'log';
-  const buildExt = state.showExt;
-  let n = 0;
-  let e = 0;
   for (let x = 0; x < p; x++) {
-    const y0 = mobius(x, setA.a, setA.b, setA.c, setA.d, p);
-    if (y0 === null) continue;
-    const y1 = t === 0 ? y0 : mobius(x, setB.a, setB.b, setB.c, setB.d, p);
-    if (y1 === null) continue;
-    if (y0 === x && y1 === x) continue; // fixed point: zero-length chord
     const si = x * 3;
-    const sx = posTab[si];
-    const sy = posTab[si + 1];
-    let ex: number;
-    let ey: number;
-    if (t === 0 || y0 === y1) {
-      ex = posTab[y0 * 3];
-      ey = posTab[y0 * 3 + 1];
-    } else if (!log) {
-      const ay = lerpAngle(angle(y0, p), angle(y1, p), t);
-      ex = R * Math.cos(ay);
-      ey = R * Math.sin(ay);
-    } else if (y0 !== 0 && y1 !== 0) {
-      const ay = lerpAngle(angle(dlogP[y0] - 1, p - 1), angle(dlogP[y1] - 1, p - 1), t);
-      ex = R * Math.cos(ay);
-      ey = R * Math.sin(ay);
-    } else {
-      // an endpoint is the zero element (ring center): interpolate linearly
-      ex = posTab[y0 * 3] + (posTab[y1 * 3] - posTab[y0 * 3]) * t;
-      ey = posTab[y0 * 3 + 1] + (posTab[y1 * 3 + 1] - posTab[y0 * 3 + 1]) * t;
+    let ex = posTab[si];
+    let ey = posTab[si + 1];
+    const y0 = mobius(x, setA.a, setA.b, setA.c, setA.d, p);
+    if (y0 !== null) {
+      const y1 = t === 0 ? y0 : mobius(x, setB.a, setB.b, setB.c, setB.d, p);
+      if (y1 !== null) {
+        if (t === 0 || y0 === y1) {
+          ex = posTab[y0 * 3];
+          ey = posTab[y0 * 3 + 1];
+        } else if (!log) {
+          const ay = lerpAngle(angle(y0, p), angle(y1, p), t);
+          ex = R * Math.cos(ay);
+          ey = R * Math.sin(ay);
+        } else if (y0 !== 0 && y1 !== 0) {
+          // on the log ring interpolation runs over exponents
+          const ay = lerpAngle(angle(dlogP[y0] - 1, p - 1), angle(dlogP[y1] - 1, p - 1), t);
+          ex = R * Math.cos(ay);
+          ey = R * Math.sin(ay);
+        } else {
+          // an endpoint is the zero element (ring center): interpolate linearly
+          ex = posTab[y0 * 3] + (posTab[y1 * 3] - posTab[y0 * 3]) * t;
+          ey = posTab[y0 * 3 + 1] + (posTab[y1 * 3 + 1] - posTab[y0 * 3 + 1]) * t;
+        }
+      }
     }
-    const r = colTab[si];
-    const g = colTab[si + 1];
-    const b = colTab[si + 2];
-    writeChord(n, sx, sy, 0, ex, ey, 0, r, g, b);
-    n++;
-    if (buildExt && writeExt(e, sx, sy, 0, ex, ey, 0, r, g, b)) e++;
+    out[si] = ex;
+    out[si + 1] = ey;
+    out[si + 2] = 0;
   }
-  return uploadInto(cBuf, eBuf, n, e);
 }
 
-function buildFp2(setA: Fp2Set, setB: Fp2Set, t: number, cBuf: WebGLBuffer, eBuf: WebGLBuffer): [number, number] {
+// The hot loop: p² evaluations per frame. Inlined scalar arithmetic, an
+// inverse-table lookup instead of extended Euclid, cached positions — an
+// animated frame at p = 499 stays allocation-free. The algebra is identical
+// to f2mobius; the test suite compares the two.
+function fillEndsFp2(setA: Fp2Set, setB: Fp2Set, t: number, out: Float32Array) {
   const p = state.p2;
-  const m = p * p - 1;
+  const q1 = p * p - 1;
   const log = state.layout === 'log';
-  const buildExt = state.showExt;
   const inv = invTab;
   const pos = posTab;
-  const col = colTab;
   const anim = t > 0;
   const tau = TAU / p;
 
@@ -1341,15 +1358,22 @@ function buildFp2(setA: Fp2Set, setB: Fp2Set, t: number, cBuf: WebGLBuffer, eBuf
   const nc0 = setB.c0, nc1 = setB.c1, nd0 = setB.d0, nd1 = setB.d1;
 
   let n = 0;
-  let e = 0;
   for (let x = 0; x < p; x++) {
     for (let y = 0; y < p; y++) {
+      const o = n * 3;
+      let ex = pos[o];
+      let ey = pos[o + 1];
+      let ez = pos[o + 2];
       // w0 = (A·z + B)/(C·z + D) for z = x + y·i, inlined over pairs.
       let de0 = (c0 * x + ns * c1 * y + d0) % p;
       let de1 = (c0 * y + c1 * x + d1) % p;
       let nrm = (de0 * de0 - ns * de1 * de1) % p;
       if (nrm < 0) nrm += p;
-      if (nrm === 0) continue; // pole: image at infinity
+      if (nrm === 0) {
+        out[o] = ex; out[o + 1] = ey; out[o + 2] = ez;
+        n++;
+        continue;
+      }
       let ninv = inv[nrm];
       const di0 = (de0 * ninv) % p;
       const di1 = (((p - de1) % p) * ninv) % p;
@@ -1365,7 +1389,11 @@ function buildFp2(setA: Fp2Set, setB: Fp2Set, t: number, cBuf: WebGLBuffer, eBuf
         de1 = (nc0 * y + nc1 * x + nd1) % p;
         nrm = (de0 * de0 - ns * de1 * de1) % p;
         if (nrm < 0) nrm += p;
-        if (nrm === 0) continue;
+        if (nrm === 0) {
+          out[o] = ex; out[o + 1] = ey; out[o + 2] = ez;
+          n++;
+          continue;
+        }
         ninv = inv[nrm];
         const e0 = (de0 * ninv) % p;
         const e1 = (((p - de1) % p) * ninv) % p;
@@ -1374,15 +1402,7 @@ function buildFp2(setA: Fp2Set, setB: Fp2Set, t: number, cBuf: WebGLBuffer, eBuf
         w1x = (m0 * e0 + ns * m1 * e1) % p;
         w1y = (m0 * e1 + m1 * e0) % p;
       }
-      if (w0x === x && w0y === y && w1x === x && w1y === y) continue;
 
-      const si = (x * p + y) * 3;
-      const sx = pos[si];
-      const sy = pos[si + 1];
-      const sz = pos[si + 2];
-      let ex: number;
-      let ey: number;
-      let ez: number;
       const same = !anim || (w0x === w1x && w0y === w1y);
       if (same) {
         const wi = (w0x * p + w0y) * 3;
@@ -1401,7 +1421,7 @@ function buildFp2(setA: Fp2Set, setB: Fp2Set, t: number, cBuf: WebGLBuffer, eBuf
         const k1 = dlogTab[w1x * p + w1y];
         if (k0 !== 0 && k1 !== 0) {
           // on the log ring a ×g step is a uniform one-notch rotation
-          const ay = lerpAngle(angle(k0 - 1, m), angle(k1 - 1, m), t);
+          const ay = lerpAngle(angle(k0 - 1, q1), angle(k1 - 1, q1), t);
           ex = R * Math.cos(ay);
           ey = R * Math.sin(ay);
           ez = 0;
@@ -1413,45 +1433,42 @@ function buildFp2(setA: Fp2Set, setB: Fp2Set, t: number, cBuf: WebGLBuffer, eBuf
           ez = pos[i0 + 2] + (pos[i1 + 2] - pos[i0 + 2]) * t;
         }
       }
-      const r = col[si];
-      const g = col[si + 1];
-      const b = col[si + 2];
-      writeChord(n, sx, sy, sz, ex, ey, ez, r, g, b);
+      out[o] = ex;
+      out[o + 1] = ey;
+      out[o + 2] = ez;
       n++;
-      if (buildExt && writeExt(e, sx, sy, sz, ex, ey, ez, r, g, b)) e++;
     }
   }
-  return uploadInto(cBuf, eBuf, n, e);
-}
-
-function phase(): number {
-  return animValue - Math.floor(animValue);
 }
 
 function rebuildScene() {
   const t = phase();
+  const fade = state.phaseMode === 'fade' && t > 0;
   if (state.mode === 'fp') {
     const A = state.fp;
     const B = t > 0 ? nextSetFp() : A;
-    if (state.phaseMode === 'arc' || t === 0) {
-      [chordVerts, extVerts] = buildFp(A, B, state.phaseMode === 'arc' ? t : 0, chordBuf, extBuf);
-      chordVerts2 = 0;
-      extVerts2 = 0;
+    if (fade) {
+      fillEndsFp(A, A, 0, endsA);
+      fillEndsFp(B, B, 0, endsB);
     } else {
-      [chordVerts, extVerts] = buildFp(A, A, 0, chordBuf, extBuf);
-      [chordVerts2, extVerts2] = buildFp(B, B, 0, chordBuf2, extBuf2);
+      fillEndsFp(A, B, state.phaseMode === 'arc' ? t : 0, endsA);
     }
-    return;
-  }
-  const A = state.fp2;
-  const B = t > 0 ? nextSetFp2() : A;
-  if (state.phaseMode === 'arc' || t === 0) {
-    [chordVerts, extVerts] = buildFp2(A, B, state.phaseMode === 'arc' ? t : 0, chordBuf, extBuf);
-    chordVerts2 = 0;
-    extVerts2 = 0;
   } else {
-    [chordVerts, extVerts] = buildFp2(A, A, 0, chordBuf, extBuf);
-    [chordVerts2, extVerts2] = buildFp2(B, B, 0, chordBuf2, extBuf2);
+    const A = state.fp2;
+    const B = t > 0 ? nextSetFp2() : A;
+    if (fade) {
+      fillEndsFp2(A, A, 0, endsA);
+      fillEndsFp2(B, B, 0, endsB);
+    } else {
+      fillEndsFp2(A, B, state.phaseMode === 'arc' ? t : 0, endsA);
+    }
+  }
+  endsBLive = fade;
+  gl.bindBuffer(gl.ARRAY_BUFFER, endBufA);
+  gl.bufferSubData(gl.ARRAY_BUFFER, 0, endsA);
+  if (fade) {
+    gl.bindBuffer(gl.ARRAY_BUFFER, endBufB);
+    gl.bufferSubData(gl.ARRAY_BUFFER, 0, endsB);
   }
 }
 
@@ -1464,19 +1481,6 @@ function resize() {
   if (w > 0 && h > 0 && (canvas.width !== w || canvas.height !== h)) {
     canvas.width = w;
     canvas.height = h;
-  }
-}
-
-function drawLinePass(cBuf: WebGLBuffer, eBuf: WebGLBuffer, cN: number, eN: number, alpha: number) {
-  if (state.showExt && eN > 0) {
-    bindAttribs(eBuf);
-    gl.uniform1f(locAlpha, alpha * 0.45);
-    gl.drawArrays(gl.LINES, 0, eN);
-  }
-  if (cN > 0) {
-    bindAttribs(cBuf);
-    gl.uniform1f(locAlpha, alpha);
-    gl.drawArrays(gl.LINES, 0, cN);
   }
 }
 
@@ -1534,13 +1538,54 @@ function draw() {
       ? Math.min(0.8, 0.12 + 30 / state.p)
       : Math.min(0.45, 0.025 + 7 / state.p2)) * alphaMul;
 
+  // Chords and extensions draw instanced; the extension geometry comes out
+  // of the vertex shader, so a fade pass only rebinds the end buffer.
+  gl.useProgram(lineProg);
+  gl.uniformMatrix3fv(locLRot, false, flat ? IDENT3 : rot);
+  gl.uniform2f(locLScale, (m / w) * state.zoom, (m / h) * state.zoom);
+  gl.uniform2f(locLOffset, offX, 0);
+  gl.uniform1f(locLDist, CAM_DIST);
+  gl.uniform1f(locLROut, R_OUT);
+  gl.bindBuffer(gl.ARRAY_BUFFER, roleBuf);
+  gl.vertexAttribPointer(locRole, 1, gl.FLOAT, false, 0, 0);
+  gl.enableVertexAttribArray(locRole);
+  gl.bindBuffer(gl.ARRAY_BUFFER, startBuf);
+  gl.vertexAttribPointer(locStart, 3, gl.FLOAT, false, 0, 0);
+  gl.enableVertexAttribArray(locStart);
+  setDivisor(locStart, 1);
+  gl.bindBuffer(gl.ARRAY_BUFFER, colorBuf);
+  gl.vertexAttribPointer(locColI, 3, gl.FLOAT, false, 0, 0);
+  gl.enableVertexAttribArray(locColI);
+  setDivisor(locColI, 1);
+  gl.enableVertexAttribArray(locEnd);
+  setDivisor(locEnd, 1);
+
   const t = phase();
-  if (state.phaseMode === 'fade' && chordVerts2 > 0) {
-    drawLinePass(chordBuf, extBuf, chordVerts, extVerts, chordAlpha * (1 - t));
-    drawLinePass(chordBuf2, extBuf2, chordVerts2, extVerts2, chordAlpha * t);
-  } else {
-    drawLinePass(chordBuf, extBuf, chordVerts, extVerts, chordAlpha);
+  const passes: Array<[WebGLBuffer, number]> = endsBLive
+    ? [[endBufA, 1 - t], [endBufB, t]]
+    : [[endBufA, 1]];
+  for (const [buf, weight] of passes) {
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.vertexAttribPointer(locEnd, 3, gl.FLOAT, false, 0, 0);
+    if (state.showExt) {
+      gl.uniform1f(locLAlpha, chordAlpha * 0.45 * weight);
+      drawInstanced(2, 4);
+    }
+    gl.uniform1f(locLAlpha, chordAlpha * weight);
+    drawInstanced(0, 2);
   }
+
+  // restore non-instanced attribute state for the point and tone-map passes
+  setDivisor(locStart, 0);
+  setDivisor(locColI, 0);
+  setDivisor(locEnd, 0);
+  gl.disableVertexAttribArray(locRole);
+  gl.disableVertexAttribArray(locStart);
+  gl.disableVertexAttribArray(locColI);
+  gl.disableVertexAttribArray(locEnd);
+  gl.enableVertexAttribArray(locPos);
+  gl.enableVertexAttribArray(locColor);
+  gl.useProgram(prog);
 
   if (state.showPoints) {
     bindAttribs(pointBuf);
