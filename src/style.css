@@ -1,0 +1,83 @@
+/* Deliberately single-theme: additive-blend rendering needs a dark ground,
+   so the whole instrument commits to it. Panel styles live in the
+   <control-panel> component; the tokens below pierce its shadow DOM. */
+
+:root {
+  color-scheme: dark;
+  --ground: #0a0c10;
+  --panel: #0e1116;
+  --hairline: #1c2027;
+  --hairline-strong: #262b33;
+  --ink: #e7eaef;
+  --muted: #8a919c;
+  --faint: #5c636d;
+  --warn: #d8a657;
+  --thumb: #c7ced9;
+  --hover: #161a21;
+  --sans: 'IBM Plex Sans', system-ui, sans-serif;
+  --mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  background: var(--ground);
+  color: var(--ink);
+  font: 13px/1.5 var(--sans);
+}
+
+/* The canvas runs full-bleed; the panel floats over it as a glass card and
+   the formula readout sits in the stage's top-right, clear of the panel. */
+
+#app {
+  position: relative;
+  height: 100vh;
+}
+
+#stage {
+  position: absolute;
+  inset: 0;
+}
+
+#glcanvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+control-panel {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  max-height: calc(100vh - 32px);
+  z-index: 2;
+}
+
+map-formula {
+  position: absolute;
+  top: 20px;
+  right: 356px;
+  z-index: 1;
+}
+
+@media (max-width: 760px) {
+  map-formula {
+    right: auto;
+    left: 20px;
+    text-align: left;
+  }
+}
