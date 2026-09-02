@@ -74,6 +74,20 @@ map-formula {
   z-index: 1;
 }
 
+/* frame-time readout in the stage's top-left */
+#fps {
+  position: absolute;
+  top: 20px;
+  left: 20px;
+  z-index: 1;
+  font-family: var(--mono, 'IBM Plex Mono', ui-monospace, monospace);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted, #8a919c);
+  pointer-events: none;
+  user-select: none;
+}
+
 @media (max-width: 760px) {
   map-formula {
     right: auto;

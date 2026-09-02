@@ -1,6 +1,6 @@
-import { LitElement, html, css, mathml } from 'lit';
+import { LitElement, html, css, mathml, noChange } from 'lit';
 import { live } from 'lit/directives/live.js';
-import { ui, type Mode, type CoefForm, type StepMode, type PhaseMode, type Layout } from './bus';
+import { ui, type Mode, type CoefForm, type StepMode, type PhaseMode, type Frame } from './bus';
 
 export type { Mode } from './bus';
 export const FP_KEYS = ['a', 'b', 'c', 'd'] as const;
@@ -22,6 +22,11 @@ const ICON_PAUSE = html`<svg viewBox="0 0 12 12" aria-hidden="true">
 // Presentation only: the panel renders state passed in through properties and
 // sends every user intent into the chanjs ui channel. Field arithmetic lives
 // in main, which owns the receiving side.
+// Wavelength readout over the 0.0001–3 range.
+function fmtWave(v: number): string {
+  return v >= 1 ? v.toFixed(2) : v >= 0.01 ? v.toFixed(3) : v.toFixed(5);
+}
+
 export class ControlPanel extends LitElement {
   static properties = {
     mode: { type: String },
@@ -32,10 +37,19 @@ export class ControlPanel extends LitElement {
     animValue: { type: Number },
     playing: { type: Boolean },
     speed: { type: Number },
+    showChords: { type: Boolean },
     showPoints: { type: Boolean },
     showExt: { type: Boolean },
+    showIn: { type: Boolean },
+    showSrc: { type: Boolean },
+    sceneOk: { type: Boolean },
+    frame: { type: String },
+    frameNote: { type: String },
+    srcNote: { type: String },
     zoom: { type: Number },
     exposure: { type: Number },
+    waveOn: { type: Boolean },
+    wave: { type: Number },
     detText: { type: String },
     detWarn: { type: Boolean },
     pole: { type: String },
@@ -47,7 +61,6 @@ export class ControlPanel extends LitElement {
     expMax: { type: Number },
     stepMode: { type: String },
     phaseMode: { type: String },
-    layout: { type: String },
     T: { attribute: false },
     tInfo: { type: String },
     tWarn: { type: Boolean },
@@ -61,10 +74,22 @@ export class ControlPanel extends LitElement {
   declare animValue: number;
   declare playing: boolean;
   declare speed: number;
+  declare showChords: boolean;
   declare showPoints: boolean;
   declare showExt: boolean;
+  declare showIn: boolean;
+  declare showSrc: boolean;
+  declare sceneOk: boolean;
+  declare frame: Frame;
+  declare frameNote: string;
+  declare srcNote: string;
   declare zoom: number;
   declare exposure: number;
+  declare waveOn: boolean;
+  declare wave: number;
+  // key of the coefficient field being typed into; its value binding is
+  // left alone until blur so that playback re-renders do not clobber it
+  private editing: string | null = null;
   declare detText: string;
   declare detWarn: boolean;
   declare pole: string;
@@ -76,7 +101,6 @@ export class ControlPanel extends LitElement {
   declare expMax: number;
   declare stepMode: StepMode;
   declare phaseMode: PhaseMode;
-  declare layout: Layout;
   declare T: Record<string, number>;
   declare tInfo: string;
   declare tWarn: boolean;
@@ -91,10 +115,19 @@ export class ControlPanel extends LitElement {
     this.animValue = 2;
     this.playing = false;
     this.speed = 0.5;
+    this.showChords = true;
     this.showPoints = true;
     this.showExt = true;
+    this.showIn = true;
+    this.showSrc = false;
+    this.sceneOk = false;
+    this.frame = 'value';
+    this.frameNote = '';
+    this.srcNote = '';
     this.zoom = 1;
     this.exposure = 1;
+    this.waveOn = false;
+    this.wave = 0.05;
     this.detText = '';
     this.detWarn = false;
     this.pole = '';
@@ -106,7 +139,6 @@ export class ControlPanel extends LitElement {
     this.expMax = 1;
     this.stepMode = 'coef';
     this.phaseMode = 'arc';
-    this.layout = 'geom';
     this.T = { a: 1, b: 1, c: 0, d: 1 };
     this.tInfo = '';
     this.tWarn = false;
@@ -205,9 +237,34 @@ export class ControlPanel extends LitElement {
           @input=${(e: Event) =>
             ui.tx.send(':coef', k, Number((e.target as HTMLInputElement).value))}
         />
-        <span class="val">${shown}</span>
+        <input
+          type="number"
+          class="val"
+          min="0"
+          max=${this.p - 1}
+          step="1"
+          .value=${this.editing === k ? noChange : live(shown)}
+          aria-label=${`Exact value of ${k}`}
+          @focus=${() => (this.editing = k)}
+          @input=${() => (this.editing = k)}
+          @blur=${() => (this.editing = null)}
+          @change=${(e: Event) => this.sendTyped(':coef', k, e)}
+        />
       </div>
     `;
+  }
+
+  // Typed coefficient: sent on Enter or blur; main wraps it into the field
+  // and the next render shows the wrapped value.
+  private sendTyped(msg: ':coef' | ':exp', k: string, e: Event) {
+    const el = e.target as HTMLInputElement;
+    const v = Number(el.value);
+    this.editing = null;
+    if (el.value.trim() === '' || !Number.isFinite(v)) {
+      this.requestUpdate();
+      return;
+    }
+    ui.tx.send(msg, k, v);
   }
 
   // A coefficient row in exponential form: one slider drives the exponent k
@@ -239,7 +296,20 @@ export class ControlPanel extends LitElement {
           @input=${(e: Event) =>
             ui.tx.send(':exp', k, Number((e.target as HTMLInputElement).value))}
         />
-        <span class="val">${zero ? '—' : kv}</span>
+        <input
+          type="number"
+          class="val"
+          min="0"
+          max=${this.expMax}
+          step="1"
+          placeholder="—"
+          .value=${this.editing === `exp:${k}` ? noChange : live(zero ? '' : String(kv))}
+          aria-label=${`Exact exponent of ${k}`}
+          @focus=${() => (this.editing = `exp:${k}`)}
+          @input=${() => (this.editing = `exp:${k}`)}
+          @blur=${() => (this.editing = null)}
+          @change=${(e: Event) => this.sendTyped(':exp', k, e)}
+        />
         <button
           type="button"
           class="quiet zbtn ${zero ? 'on' : ''}"
@@ -536,31 +606,33 @@ export class ControlPanel extends LitElement {
 
       <section>
         <h2>View</h2>
-        <div class="row" title="Element order: by value, or by discrete log over g">
-          <span class="lbl-wide">layout</span>
-          <div class="seg" role="radiogroup" aria-label="Layout">
-            <label>
-              <input
-                type="radio"
-                name="layout"
-                value="geom"
-                .checked=${live(this.layout === 'geom')}
-                @change=${() => ui.tx.send(':layout', 'geom')}
-              />
-              <span class="upright">${this.mode === 'fp' ? 'circle' : 'torus'}</span>
-            </label>
-            <label>
-              <input
-                type="radio"
-                name="layout"
-                value="log"
-                .checked=${live(this.layout === 'log')}
-                @change=${() => ui.tx.send(':layout', 'log')}
-              />
-              <span class="upright"><math><msup><mi>g</mi><mi>k</mi></msup></math>&nbsp;ring</span>
-            </label>
-          </div>
-        </div>
+        ${this.mode === 'fp'
+          ? html`
+              <div
+                class="row"
+                title="Element layout: by value, or by the coordinate in which the map is a multiplication or a rotation — its fixed points as 0 and ∞"
+              >
+                <span class="lbl-wide">frame</span>
+                <div class="seg" role="radiogroup" aria-label="Frame">
+                  ${(['value', 'eigen'] as const).map(
+                    (o) => html`
+                      <label>
+                        <input
+                          type="radio"
+                          name="frame"
+                          value=${o}
+                          .checked=${live(this.frame === o)}
+                          @change=${() => ui.tx.send(':frame', o)}
+                        />
+                        <span class="upright">${o}</span>
+                      </label>
+                    `,
+                  )}
+                </div>
+              </div>
+              ${this.frame === 'eigen' && this.frameNote ? html`<p class="status">${this.frameNote}</p>` : ''}
+            `
+          : ''}
         <div class="row">
           <span class="lbl-wide">phase</span>
           <div class="seg" role="radiogroup" aria-label="Phase rendering">
@@ -581,6 +653,15 @@ export class ControlPanel extends LitElement {
           </div>
         </div>
         <div class="row checks">
+          <label class="check" title="The chords x → f(x) themselves; off, only the overlays remain">
+            <input
+              type="checkbox"
+              .checked=${live(this.showChords)}
+              @change=${(e: Event) =>
+                ui.tx.send(':view', 'showChords', (e.target as HTMLInputElement).checked)}
+            />
+            chords
+          </label>
           <label class="check">
             <input
               type="checkbox"
@@ -599,7 +680,71 @@ export class ControlPanel extends LitElement {
             />
             extensions
           </label>
+          ${this.sceneOk
+            ? html`
+                <label
+                  class="check"
+                  title="The optics scene: the emitter — a wavefront with its cusps on the mirror — and its light, before and after the mirror; in wave mode the field of the emitter, coloured by its wavelength"
+                >
+                  <input
+                    type="checkbox"
+                    .checked=${live(this.showSrc)}
+                    @change=${(e: Event) =>
+                      ui.tx.send(':view', 'showSrc', (e.target as HTMLInputElement).checked)}
+                  />
+                  sources
+                </label>
+              `
+            : ''}
+          ${this.showSrc && this.sceneOk
+            ? html`
+                <label class="check" title="The light before the mirror: from the emitter to the mirror and, with extensions, before it enters; switch it off to compare the reflected light with the chords">
+                  <input
+                    type="checkbox"
+                    .checked=${live(this.showIn)}
+                    @change=${(e: Event) =>
+                      ui.tx.send(':view', 'showIn', (e.target as HTMLInputElement).checked)}
+                  />
+                  incoming
+                </label>
+                <label class="check" title="The sources radiate with phases: the field is the Huygens sum over the mirror elements they light">
+                  <input
+                    type="checkbox"
+                    .checked=${live(this.waveOn)}
+                    @change=${(e: Event) =>
+                      ui.tx.send(':view', 'waveOn', (e.target as HTMLInputElement).checked)}
+                  />
+                  wave
+                </label>
+              `
+            : ''}
         </div>
+        ${this.showSrc && this.sceneOk
+          ? html`
+              ${this.srcNote ? html`<p class="status">${this.srcNote}</p>` : ''}
+            `
+          : ''}
+        ${this.showSrc && this.waveOn && this.sceneOk
+          ? html`
+              <div class="row" title="Wavelength in units of the circle radius; the mirror elements must sit closer than λ/2">
+                <span class="lbl-wide math"><math><mi>λ</mi></math></span>
+                <input
+                  type="range"
+                  min="-4"
+                  max="0.5"
+                  step="0.02"
+                  .value=${live(String(Math.log10(this.wave)))}
+                  aria-label="Wavelength"
+                  @input=${(e: Event) =>
+                    ui.tx.send(
+                      ':wave-len',
+                      Number(Math.pow(10, Number((e.target as HTMLInputElement).value)).toPrecision(3)),
+                    )}
+                />
+                <span class="val">${fmtWave(this.wave)}</span>
+              </div>
+            `
+          : ''}
         <div class="row" title="Brightness compression of dense line crossings">
           <span class="lbl-wide">glow</span>
           <input
@@ -614,15 +759,15 @@ export class ControlPanel extends LitElement {
           />
           <span class="val">${this.exposure.toFixed(2)}</span>
         </div>
-        <div class="row" title="Mouse wheel over the canvas zooms; double-click resets">
+        <div class="row" title="Mouse wheel over the canvas zooms; double-click returns to ×1">
           <span class="lbl-wide">zoom</span>
           <span class="val">×${this.zoom.toFixed(2)}</span>
           <button
             type="button"
             class="quiet"
-            ?disabled=${this.zoom === 1}
-            @click=${() => ui.tx.send(':zoom-reset')}
-          >reset</button>
+            title="Every setting back to its default"
+            @click=${() => ui.tx.send(':reset')}
+          >reset all</button>
         </div>
       </section>
     `;
@@ -767,6 +912,11 @@ export class ControlPanel extends LitElement {
       color: var(--muted, #8a919c);
     }
 
+    /* one-letter math labels line up with the word labels of the section */
+    .lbl-wide.math {
+      min-width: 28px;
+    }
+
     .val {
       width: 44px;
       flex: none;
@@ -774,6 +924,29 @@ export class ControlPanel extends LitElement {
       font-family: var(--mono, ui-monospace, monospace);
       font-variant-numeric: tabular-nums;
       color: var(--ink, #e7eaef);
+    }
+
+    /* exact-value field beside a slider: as quiet as the readout it replaces */
+    input[type='number'].val {
+      width: 50px;
+      height: 22px;
+      padding: 0 4px;
+      font-size: 13px;
+      background: transparent;
+      border-color: transparent;
+      -moz-appearance: textfield;
+    }
+
+    input[type='number'].val:hover,
+    input[type='number'].val:focus {
+      background: var(--ground, #0a0c10);
+      border-color: var(--hairline-strong, #262b33);
+    }
+
+    input[type='number'].val::-webkit-inner-spin-button,
+    input[type='number'].val::-webkit-outer-spin-button {
+      -webkit-appearance: none;
+      margin: 0;
     }
 
     .status {
@@ -1063,7 +1236,8 @@ export class ControlPanel extends LitElement {
     }
 
     .row.checks {
-      gap: 18px;
+      gap: 14px 18px;
+      flex-wrap: wrap;
     }
 
     .quiet {

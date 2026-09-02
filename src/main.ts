@@ -23,7 +23,7 @@ import {
 } from './field';
 import { createProgram } from './webgl';
 import { ControlPanel, FP_KEYS, FP2_KEYS } from './panel';
-import { ui, type Mode, type StepMode, type PhaseMode, type Layout } from './bus';
+import { ui, type Mode, type StepMode, type PhaseMode, type Frame } from './bus';
 import { MapFormula } from './formula';
 
 type FpKey = (typeof FP_KEYS)[number];
@@ -48,19 +48,62 @@ const state = {
   coefForm: 'cart' as 'cart' | 'exp',
   stepMode: 'coef' as StepMode,
   phaseMode: 'arc' as PhaseMode,
-  layout: 'geom' as Layout,
   T: { a: 1, b: 1, c: 0, d: 1 },
   playing: false,
   speed: 0.5,
+  showChords: true, // off: only the optics overlays remain, for comparison
   showPoints: true,
   showExt: true,
+  showIn: true, // the optics scene: the light before the mirror
+  showSrc: false, // the optics scene: what lights the mirror so that the reflections are the chords
+  frame: 'value' as Frame,
   zoom: 1,
   exposure: 1,
+  // Wave field of the sources (Huygens sum over the mirror elements);
+  // `wave` is the wavelength in units of the circle radius.
+  waveOn: false,
+  wave: 0.05,
+  rays: 2048, // mirror points of the optics scene's ray picture
 };
+
+const WAVE_MIN = 0.0001;
+const WAVE_MAX = 3;
+
+// The wave field's colour: the slider's range of λ, logarithmic, is laid
+// onto the visible spectrum, 380 nm at WAVE_MIN to 750 nm at WAVE_MAX,
+// and the spectral colour is scaled so that its brightest channel is 1.
+function waveTint(wave: number): [number, number, number] {
+  const t = (Math.log10(wave) - Math.log10(WAVE_MIN)) / (Math.log10(WAVE_MAX) - Math.log10(WAVE_MIN));
+  const nm = 380 + 370 * Math.min(1, Math.max(0, t));
+  let r = 0;
+  let g = 0;
+  let b = 0;
+  if (nm < 440) {
+    r = (0.7 * (440 - nm)) / 60; // violet, not magenta
+    b = 1;
+  } else if (nm < 490) {
+    g = (nm - 440) / 50;
+    b = 1;
+  } else if (nm < 510) {
+    g = 1;
+    b = (510 - nm) / 20;
+  } else if (nm < 580) {
+    r = (nm - 510) / 70;
+    g = 1;
+  } else if (nm < 645) {
+    r = 1;
+    g = (645 - nm) / 65;
+  } else r = 1;
+  const gamma = (v: number) => Math.pow(v, 0.8);
+  const c: [number, number, number] = [gamma(r), gamma(g), gamma(b)];
+  const mx = Math.max(c[0], c[1], c[2]);
+  return [c[0] / mx, c[1] / mx, c[2] / mx];
+}
+const HUY_MAX = 16384; // elements the field shader sums per pixel
 
 let ns = nonResidue(state.p2); // i² in the current F_{p²}
 let invTab = invTable(state.p2); // inverse table of F_p for the torus hot loop
-let rootP = primitiveRoot(state.p); // generator of F*_p for the ×g walk and log layout
+let rootP = primitiveRoot(state.p); // generator of F*_p for the ×g walk
 
 // Continuous animation position: in 'coef' step mode the integer part is the
 // armed coefficient's value (or exponent), in the group-walk modes it is a
@@ -109,11 +152,18 @@ function updateUrl() {
       q.set('t', `${t.a},${t.b},${t.c},${t.d}`);
     }
     if (state.phaseMode === 'fade') q.set('phase', 'fade');
-    if (state.layout === 'log') q.set('layout', 'log');
+    if (state.frame === 'eigen') q.set('frame', 'eigen');
     const armDef = state.mode === 'fp' || state.coefForm === 'exp' ? 'a' : 'a0';
     if (state.stepMode === 'coef' && curAnimKey() !== armDef) q.set('arm', curAnimKey());
+    if (!state.showChords) q.set('chords', '0');
     if (!state.showPoints) q.set('points', '0');
     if (!state.showExt) q.set('ext', '0');
+    if (!state.showIn) q.set('in', '0');
+    if (state.showSrc) {
+      q.set('src', '1');
+      if (state.waveOn) q.set('wave', String(state.wave));
+      if (state.rays !== 2048) q.set('rays', String(state.rays));
+    }
     if (state.exposure !== 1) q.set('glow', String(state.exposure));
     if (state.zoom !== 1) q.set('zoom', state.zoom.toFixed(2));
     if (state.playing) q.set('play', '1');
@@ -139,7 +189,7 @@ function curAnimKey(): string {
 // ---------- field construction choices for F_{p²} ----------
 // The picture formally depends on them: the non-residue ns fixes the basis
 // {1, i} and with it the torus coordinates; the generator g fixes the
-// exponential form gᵏ, the ×g steps and the log layout order.
+// exponential form gᵏ and the ×g steps.
 
 let nsFactors = primeFactors(state.p2 * state.p2 - 1);
 
@@ -175,20 +225,6 @@ function buildDlog(): Int32Array {
 let gen: F2 = firstGenerator();
 let genIsDefault = true; // the URL carries g only when the user changed it
 let dlogTab = buildDlog();
-
-// The same table for F_p over the primitive root, used by the log layout.
-function buildDlogP(): Int32Array {
-  const p = state.p;
-  const t = new Int32Array(p);
-  let a = 1;
-  for (let k = 0; k < p - 1; k++) {
-    t[a] = k + 1;
-    a = (a * rootP) % p;
-  }
-  return t;
-}
-
-let dlogP = buildDlogP();
 
 function dlogOf(u: number, v: number): number | null {
   const t = dlogTab[u * state.p2 + v];
@@ -420,17 +456,25 @@ function syncPanel() {
   panel.animValue = animValue;
   panel.playing = state.playing;
   panel.speed = state.speed;
+  panel.showChords = state.showChords;
   panel.showPoints = state.showPoints;
   panel.showExt = state.showExt;
+  panel.showIn = state.showIn;
+  panel.showSrc = state.showSrc;
+  panel.sceneOk = sceneOk();
+  panel.frame = state.frame;
+  panel.frameNote = frameNote;
+  panel.srcNote = srcNote;
   panel.zoom = state.zoom;
   panel.exposure = state.exposure;
+  panel.waveOn = state.waveOn;
+  panel.wave = state.wave;
   panel.i2 = state.mode === 'fp2' ? ns : 0;
   panel.coefForm = state.mode === 'fp2' ? state.coefForm : 'cart';
   panel.gDisp = state.mode === 'fp' ? String(rootP) : fmtF2(gen);
   panel.expMax = state.p2 * state.p2 - 2;
   panel.stepMode = state.stepMode;
   panel.phaseMode = state.phaseMode;
-  panel.layout = state.layout;
   panel.T = { ...state.T };
   panel.tInfo = stepText();
   panel.tWarn = !stepInfo.valid;
@@ -506,9 +550,25 @@ function poleTextFp2(): string {
   return `pole: z = ${fmtF2(z0)} ↦ ∞`;
 }
 
+// the optics scene exists for F_p only: it is put away on the way to F_p²
+// and brought back on the way home
+let sceneSaved: { showSrc: boolean; waveOn: boolean } | null = null;
+
 ui.rx.on(':mode', (m) => {
   if (m === state.mode) return;
   state.mode = m;
+  if (zoomByFit) setZoom(1);
+  if (m === 'fp2') {
+    sceneSaved = { showSrc: state.showSrc, waveOn: state.waveOn };
+    state.showSrc = false;
+    state.waveOn = false;
+    state.frame = 'value';
+  } else if (sceneSaved) {
+    state.showSrc = sceneSaved.showSrc;
+    state.waveOn = sceneSaved.waveOn;
+    sceneSaved = null;
+    srcFit = state.showSrc;
+  }
   canvas.style.cursor = m === 'fp2' ? 'grab' : 'default';
   reallocBuffers();
   rebuildPoints();
@@ -518,7 +578,9 @@ ui.rx.on(':mode', (m) => {
 });
 
 ui.rx.on(':coef', (key, value) => {
-  curCoefs()[key] = value;
+  srcFit = state.showSrc;
+  const pp = curP();
+  curCoefs()[key] = Number.isFinite(value) ? (((Math.round(value) % pp) + pp) % pp) : 0;
   if (state.stepMode === 'coef' && key === curAnimKey()) animValue = value;
   if (state.stepMode === 'iter') resetWalk(); // an edited map restarts its iteration
   dirty = true;
@@ -561,7 +623,6 @@ ui.rx.on(':form', (form) => {
 
 ui.rx.on(':ns-step', (delta) => {
   stepNs(delta);
-  rebuildPoints(); // the log layout order follows the new generator
   resetWalk();
   dirty = true; // the basis {1, i} and with it the arithmetic changed
   syncPanel();
@@ -570,13 +631,14 @@ ui.rx.on(':ns-step', (delta) => {
 ui.rx.on(':g-step', (delta) => {
   if (state.mode !== 'fp2') return; // in F_p the generator is fixed
   stepGenerator(delta);
-  rebuildPoints(); // the log layout order follows the new generator
   resetWalk();
   dirty = true;
   syncPanel();
 });
 
-ui.rx.on(':exp', (key, k) => {
+ui.rx.on(':exp', (key, kRaw) => {
+  const m = state.p2 * state.p2 - 1;
+  const k = Number.isFinite(kRaw) ? ((Math.round(kRaw) % m) + m) % m : 0;
   const w = f2pow(gen, k, ns, state.p2);
   state.fp2[`${key}0` as Fp2Key] = w[0];
   state.fp2[`${key}1` as Fp2Key] = w[1];
@@ -611,13 +673,6 @@ ui.rx.on(':phase-mode', (m) => {
   syncPanel();
 });
 
-ui.rx.on(':layout', (layout) => {
-  state.layout = layout;
-  rebuildPoints();
-  dirty = true;
-  syncPanel();
-});
-
 ui.rx.on(':tset', (key, value) => {
   state.T[key] = mod(Math.round(value) || 0, curP());
   resetWalk();
@@ -636,12 +691,16 @@ ui.rx.on(':speed', (value) => {
 
 ui.rx.on(':view', (key, value) => {
   state[key] = value;
+  if (key === 'waveOn' || key === 'showSrc') dirty = true; // computed with the scene
+  if (key === 'showSrc' && value) srcFit = true;
+  if (key === 'showSrc' && !value && zoomByFit) setZoom(1);
   invalidate();
   syncPanel();
 });
 
 ui.rx.on(':preset', (coefs) => {
   Object.assign(curCoefs(), coefs);
+  srcFit = state.showSrc;
   if (state.stepMode === 'coef') animValue = armedValue();
   if (state.stepMode === 'iter') resetWalk();
   dirty = true;
@@ -654,7 +713,26 @@ ui.rx.on(':exposure', (value) => {
   syncPanel();
 });
 
-ui.rx.on(':zoom-reset', () => setZoom(1));
+ui.rx.on(':wave-len', (value) => {
+  state.wave = Math.min(WAVE_MAX, Math.max(WAVE_MIN, value));
+  dirty = true; // the source amplitudes on the mirror depend on k
+  invalidate();
+  syncPanel();
+});
+
+ui.rx.on(':frame', (frame) => {
+  state.frame = frame;
+  srcFit = state.showSrc;
+  dirty = true;
+  invalidate();
+  syncPanel();
+});
+
+ui.rx.on(':reset', () => {
+  // the defaults are what a bare address gives; the reload rebuilds every
+  // table from them
+  location.href = location.pathname;
+});
 
 // Wheel and trackpad pinch (Ctrl+wheel) zoom around the scene center;
 // double-click resets zoom and, on the torus, the orientation.
@@ -777,8 +855,13 @@ function step(delta: number) {
 const ZOOM_MIN = 0.1;
 const ZOOM_MAX = 10;
 
-function setZoom(z: number) {
+// A zoom set by fitSources() is undone when the scene goes away: on a
+// mode switch and when the sources are hidden. A zoom the user set stays.
+let zoomByFit = false;
+
+function setZoom(z: number, byFit = false) {
   state.zoom = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, z));
+  zoomByFit = byFit;
   invalidate();
   syncPanel();
 }
@@ -787,7 +870,6 @@ function applyP(p: number) {
   if (state.mode === 'fp') {
     state.p = p;
     rootP = primitiveRoot(p);
-    dlogP = buildDlogP();
     for (const k of FP_KEYS) state.fp[k] = mod(state.fp[k], p);
   } else {
     state.p2 = p;
@@ -895,15 +977,13 @@ void main() {
   float len = length(d);
   vec3 pos = aStart;
   if (len > 1e-6) {
+    vec3 u = d / len;
     if (aRole < 0.5) pos = aStart;
     else if (aRole < 1.5) pos = aEnd;
-    else {
-      vec3 u = d / len;
-      if (aRole < 2.5) pos = aStart;
-      else if (aRole < 3.5) pos = aStart - u * rayOut(aStart, -u);
-      else if (aRole < 4.5) pos = aEnd;
-      else pos = aEnd + u * rayOut(aEnd, u);
-    }
+    else if (aRole < 2.5) pos = aStart;
+    else if (aRole < 3.5) pos = aStart - u * rayOut(aStart, -u);
+    else if (aRole < 4.5) pos = aEnd;
+    else pos = aEnd + u * rayOut(aEnd, u);
   }
   vec3 v = uRot * pos;
   float w = (uDist - v.z) / uDist;
@@ -912,17 +992,37 @@ void main() {
 }
 `;
 
-const lineProg = createProgram(gl, LINE_VS, FS);
-const locRole = gl.getAttribLocation(lineProg, 'aRole');
-const locStart = gl.getAttribLocation(lineProg, 'aStart');
-const locEnd = gl.getAttribLocation(lineProg, 'aEnd');
-const locColI = gl.getAttribLocation(lineProg, 'aColorI');
-const locLRot = gl.getUniformLocation(lineProg, 'uRot');
-const locLScale = gl.getUniformLocation(lineProg, 'uScale');
-const locLOffset = gl.getUniformLocation(lineProg, 'uOffset');
-const locLDist = gl.getUniformLocation(lineProg, 'uDist');
-const locLROut = gl.getUniformLocation(lineProg, 'uROut');
-const locLAlpha = gl.getUniformLocation(lineProg, 'uAlpha');
+type LineLocs = {
+  prog: WebGLProgram;
+  role: number;
+  start: number;
+  end: number;
+  colI: number;
+  rot: WebGLUniformLocation | null;
+  scale: WebGLUniformLocation | null;
+  offset: WebGLUniformLocation | null;
+  dist: WebGLUniformLocation | null;
+  rOut: WebGLUniformLocation | null;
+  alpha: WebGLUniformLocation | null;
+};
+
+function lineLocs(g: WebGLRenderingContext | WebGL2RenderingContext, prog: WebGLProgram): LineLocs {
+  return {
+    prog,
+    role: g.getAttribLocation(prog, 'aRole'),
+    start: g.getAttribLocation(prog, 'aStart'),
+    end: g.getAttribLocation(prog, 'aEnd'),
+    colI: g.getAttribLocation(prog, 'aColorI'),
+    rot: g.getUniformLocation(prog, 'uRot'),
+    scale: g.getUniformLocation(prog, 'uScale'),
+    offset: g.getUniformLocation(prog, 'uOffset'),
+    dist: g.getUniformLocation(prog, 'uDist'),
+    rOut: g.getUniformLocation(prog, 'uROut'),
+    alpha: g.getUniformLocation(prog, 'uAlpha'),
+  };
+}
+
+const lineL = lineLocs(gl, createProgram(gl, LINE_VS, FS));
 
 const instAngle = gl2 ? null : gl.getExtension('ANGLE_instanced_arrays');
 if (!gl2 && !instAngle) throw new Error('instanced rendering is not available');
@@ -933,9 +1033,9 @@ function setDivisor(loc: number, d: number) {
   else instAngle!.vertexAttribDivisorANGLE(loc, d);
 }
 
-function drawInstanced(first: number, nVerts: number) {
-  if (gl2) gl2.drawArraysInstanced(gl.LINES, first, nVerts, nInst);
-  else instAngle!.drawArraysInstancedANGLE(gl.LINES, first, nVerts, nInst);
+function drawInstanced(first: number, nVerts: number, n = nInst) {
+  if (gl2) gl2.drawArraysInstanced(gl.LINES, first, nVerts, n);
+  else instAngle!.drawArraysInstancedANGLE(gl.LINES, first, nVerts, n);
 }
 
 gl.enableVertexAttribArray(locPos);
@@ -968,21 +1068,99 @@ void main() {
 }
 `;
 
-let tmProg: WebGLProgram | null = null;
-let locTmPos = 0;
-let locTmTex: WebGLUniformLocation | null = null;
-let locTmExt: WebGLUniformLocation | null = null;
-let locTmInv: WebGLUniformLocation | null = null;
-let locTmExp: WebGLUniformLocation | null = null;
-let locTmExtOn: WebGLUniformLocation | null = null;
-let locTmBg: WebGLUniformLocation | null = null;
+type TmLocs = {
+  prog: WebGLProgram;
+  pos: number;
+  tex: WebGLUniformLocation | null;
+  ext: WebGLUniformLocation | null;
+  inv: WebGLUniformLocation | null;
+  exp: WebGLUniformLocation | null;
+  extOn: WebGLUniformLocation | null;
+  bg: WebGLUniformLocation | null;
+};
+
+function tmLocs(g: WebGL2RenderingContext, fs: string): TmLocs {
+  const prog = createProgram(g, TM_VS, fs);
+  return {
+    prog,
+    pos: g.getAttribLocation(prog, 'aPos'),
+    tex: g.getUniformLocation(prog, 'uTex'),
+    ext: g.getUniformLocation(prog, 'uExt'),
+    inv: g.getUniformLocation(prog, 'uInvSize'),
+    exp: g.getUniformLocation(prog, 'uExposure'),
+    extOn: g.getUniformLocation(prog, 'uExtOn'),
+    bg: g.getUniformLocation(prog, 'uBg'),
+  };
+}
+
+// ---------- wave field of the sources: Huygens sum ----------
+// Every mirror element lit by a source is a secondary source with the
+// complex amplitude c it receives (sum over sources of e^{iks}/√dist, s the
+// signed optical path). The field at a pixel is Σ c·e^{ik r}/√r over the
+// elements, the intensity its squared modulus — the Kirchhoff integral over
+// the mirror without the obliquity factor. The reflected rays, caustics,
+// Airy fringes and diffraction all come out of the sum; the element spacing
+// must stay below λ/2 or the array shows grating lobes.
+const HUY_FS = `
+precision highp float;
+uniform highp sampler2D uEl;
+uniform int uCount;
+uniform float uInvCount;
+uniform float uK;
+uniform float uRMin;
+uniform float uInvR;
+uniform vec2 uScale;
+uniform vec2 uOffset;
+uniform vec2 uSize;
+uniform float uNorm;
+uniform vec3 uTint;
+void main() {
+  vec2 ndc = (gl_FragCoord.xy / uSize) * 2.0 - 1.0;
+  vec2 r = (ndc - uOffset) / uScale;
+  vec2 acc = vec2(0.0);
+  for (int i = 0; i < ${HUY_MAX}; i++) {
+    if (i >= uCount) break;
+    vec4 e = texture2D(uEl, vec2((float(i) + 0.5) * uInvCount, 0.5));
+    vec2 dv = r - e.xy;
+    float d = max(length(dv), uRMin);
+    // Kirchhoff obliquity: an element radiates inwards, not through the mirror
+    float obl = 0.5 * (1.0 - dot(e.xy * uInvR, dv) / d);
+    float ph = uK * d;
+    vec2 w = vec2(cos(ph), sin(ph)) * (obl * inversesqrt(d));
+    acc += vec2(e.z * w.x - e.w * w.y, e.z * w.y + e.w * w.x);
+  }
+  float I = dot(acc, acc) * uNorm;
+  gl_FragColor = vec4(uTint * I, 1.0);
+}
+`;
+
+type HuyLocs = {
+  prog: WebGLProgram;
+  pos: number;
+  el: WebGLUniformLocation | null;
+  count: WebGLUniformLocation | null;
+  invCount: WebGLUniformLocation | null;
+  k: WebGLUniformLocation | null;
+  rMin: WebGLUniformLocation | null;
+  invR: WebGLUniformLocation | null;
+  scale: WebGLUniformLocation | null;
+  offset: WebGLUniformLocation | null;
+  size: WebGLUniformLocation | null;
+  norm: WebGLUniformLocation | null;
+  tint: WebGLUniformLocation | null;
+};
+
+let tmL: TmLocs | null = null;
+let huyL: HuyLocs | null = null;
+let huyTex: WebGLTexture | null = null;
 let quadBuf: WebGLBuffer | null = null;
 let fbo: WebGLFramebuffer | null = null;
 let fboTex: WebGLTexture | null = null;
 let fboW = 0;
 let fboH = 0;
 // Chord extensions accumulate in a separate half-size target: they are the
-// long faint lines, and their fill cost scales with the target area.
+// long faint lines, and their fill cost scales with the target area. The
+// wave field renders into the same target.
 let extFbo: WebGLFramebuffer | null = null;
 let extTex: WebGLTexture | null = null;
 let extW = 0;
@@ -990,14 +1168,29 @@ let extH = 0;
 let halfExt = false;
 
 if (post && gl2) {
-  tmProg = createProgram(gl2, TM_VS, TM_FS);
-  locTmPos = gl2.getAttribLocation(tmProg, 'aPos');
-  locTmTex = gl2.getUniformLocation(tmProg, 'uTex');
-  locTmExt = gl2.getUniformLocation(tmProg, 'uExt');
-  locTmInv = gl2.getUniformLocation(tmProg, 'uInvSize');
-  locTmExp = gl2.getUniformLocation(tmProg, 'uExposure');
-  locTmExtOn = gl2.getUniformLocation(tmProg, 'uExtOn');
-  locTmBg = gl2.getUniformLocation(tmProg, 'uBg');
+  tmL = tmLocs(gl2, TM_FS);
+  const hp = createProgram(gl2, TM_VS, HUY_FS);
+  huyL = {
+    prog: hp,
+    pos: gl2.getAttribLocation(hp, 'aPos'),
+    el: gl2.getUniformLocation(hp, 'uEl'),
+    count: gl2.getUniformLocation(hp, 'uCount'),
+    invCount: gl2.getUniformLocation(hp, 'uInvCount'),
+    k: gl2.getUniformLocation(hp, 'uK'),
+    rMin: gl2.getUniformLocation(hp, 'uRMin'),
+    invR: gl2.getUniformLocation(hp, 'uInvR'),
+    scale: gl2.getUniformLocation(hp, 'uScale'),
+    offset: gl2.getUniformLocation(hp, 'uOffset'),
+    size: gl2.getUniformLocation(hp, 'uSize'),
+    norm: gl2.getUniformLocation(hp, 'uNorm'),
+    tint: gl2.getUniformLocation(hp, 'uTint'),
+  };
+  huyTex = gl2.createTexture();
+  gl2.bindTexture(gl2.TEXTURE_2D, huyTex);
+  gl2.texParameteri(gl2.TEXTURE_2D, gl2.TEXTURE_MIN_FILTER, gl2.NEAREST);
+  gl2.texParameteri(gl2.TEXTURE_2D, gl2.TEXTURE_MAG_FILTER, gl2.NEAREST);
+  gl2.texParameteri(gl2.TEXTURE_2D, gl2.TEXTURE_WRAP_S, gl2.CLAMP_TO_EDGE);
+  gl2.texParameteri(gl2.TEXTURE_2D, gl2.TEXTURE_WRAP_T, gl2.CLAMP_TO_EDGE);
   quadBuf = gl2.createBuffer();
   gl2.bindBuffer(gl2.ARRAY_BUFFER, quadBuf);
   gl2.bufferData(gl2.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl2.STATIC_DRAW);
@@ -1042,6 +1235,25 @@ function ensureFbo(w: number, h: number): boolean {
 const roleBuf = gl.createBuffer()!;
 const startBuf = gl.createBuffer()!;
 const colorBuf = gl.createBuffer()!;
+// The optics scene's rays: four instance sets (start, end, color), the
+// light after the mirror and before it, each with its outer part — the
+// outer light is drawn with the extensions switch, the light before the
+// mirror with the incoming switch.
+type RaySet = { s: Float32Array; e: Float32Array; c: Float32Array; n: number; bs: WebGLBuffer; be: WebGLBuffer; bc: WebGLBuffer };
+const newRaySet = (): RaySet => ({
+  s: new Float32Array(0),
+  e: new Float32Array(0),
+  c: new Float32Array(0),
+  n: 0,
+  bs: gl.createBuffer()!,
+  be: gl.createBuffer()!,
+  bc: gl.createBuffer()!,
+});
+const raysR = newRaySet(); // reflected: the chords
+const raysI = newRaySet(); // incoming: from the emitter to the mirror
+const outR = newRaySet(); // after it leaves through the wall
+const outI = newRaySet(); // before it enters, and the virtual continuation towards the caustic
+const spBuf = gl.createBuffer()!;
 const endBufA = gl.createBuffer()!;
 const endBufB = gl.createBuffer()!;
 const pointBuf = gl.createBuffer()!;
@@ -1167,6 +1379,7 @@ function f2color(x: number, y: number, p: number): [number, number, number] {
 
 let posTab = new Float32Array(0); // element positions, ·3 (fp: by x; fp2: by x·p+y)
 let colTab = new Float32Array(0); // element colors, same indexing
+let normTab = new Float32Array(0); // surface normals at the elements (0 at the ring center)
 let endsA = new Float32Array(0); // chord end positions, ·3 per element
 let endsB = new Float32Array(0); // the second diagram of a cross-fade
 let endsBLive = false;
@@ -1183,33 +1396,38 @@ function reallocBuffers() {
 
 let pointCount = 0;
 
-// Fills the point buffer and the position/color caches. In the log layout
-// the nonzero elements are ordered by discrete log on a flat ring — powers
-// of the generator march around it uniformly — and zero sits at the center.
+// Fills the point buffer and the position/color caches.
 function rebuildPoints() {
   if (state.mode === 'fp') {
     const p = state.p;
     posTab = new Float32Array(p * 3);
     colTab = new Float32Array(p * 3);
+    normTab = new Float32Array(p * 3);
     const data = new Float32Array(p * 6);
+    if (angTab.length !== p || state.frame !== 'eigen' || !eigen) {
+      // the value frame: element x at angle 2πx/p
+      angTab = new Float32Array(p);
+      onRim = new Uint8Array(p);
+      for (let x = 0; x < p; x++) {
+        angTab[x] = angle(x, p);
+        onRim[x] = 1;
+      }
+    }
     for (let x = 0; x < p; x++) {
       let px = 0;
       let py = 0;
       let cr = 0.45;
       let cg = 0.47;
       let cb = 0.5;
-      if (state.layout === 'geom') {
-        const a = angle(x, p);
-        px = R * Math.cos(a);
-        py = R * Math.sin(a);
+      {
+        if (onRim[x]) {
+          px = R * Math.cos(angTab[x]);
+          py = R * Math.sin(angTab[x]);
+        }
         [cr, cg, cb] = hueColor(x / p);
-      } else if (x !== 0) {
-        const a = angle(dlogP[x] - 1, p - 1);
-        px = R * Math.cos(a);
-        py = R * Math.sin(a);
-        [cr, cg, cb] = hueColor((dlogP[x] - 1) / (p - 1));
       }
       posTab.set([px, py, 0], x * 3);
+      normTab.set([px / R, py / R, 0], x * 3);
       colTab.set([cr, cg, cb], x * 3);
       data.set([px, py, 0, cr * 0.55, cg * 0.55, cb * 0.55], x * 6);
     }
@@ -1220,9 +1438,9 @@ function rebuildPoints() {
     return;
   }
   const p = state.p2;
-  const m = p * p - 1;
   posTab = new Float32Array(p * p * 3);
   colTab = new Float32Array(p * p * 3);
+  normTab = new Float32Array(p * p * 3);
   const data = new Float32Array(p * p * 6);
   let n = 0;
   for (let x = 0; x < p; x++) {
@@ -1230,22 +1448,23 @@ function rebuildPoints() {
       let px = 0;
       let py = 0;
       let pz = 0;
+      let nx = 0;
+      let ny = 0;
+      let nz = 0;
       let cr = 0.45;
       let cg = 0.47;
       let cb = 0.5;
-      if (state.layout === 'geom') {
-        [px, py, pz] = torusPos((TAU * x) / p, (TAU * y) / p);
+      {
+        const th = (TAU * x) / p;
+        const ph = (TAU * y) / p;
+        [px, py, pz] = torusPos(th, ph);
+        nx = Math.cos(ph) * Math.cos(th);
+        ny = Math.cos(ph) * Math.sin(th);
+        nz = Math.sin(ph);
         [cr, cg, cb] = f2color(x, y, p);
-      } else {
-        const k = dlogTab[x * p + y];
-        if (k !== 0) {
-          const a = angle(k - 1, m);
-          px = R * Math.cos(a);
-          py = R * Math.sin(a);
-          [cr, cg, cb] = hueColor((k - 1) / m);
-        }
       }
       posTab.set([px, py, pz], n * 3);
+      normTab.set([nx, ny, nz], n * 3);
       colTab.set([cr, cg, cb], n * 3);
       data.set([px, py, pz, cr * 0.5, cg * 0.5, cb * 0.5], n * 6);
       n++;
@@ -1331,7 +1550,6 @@ function phase(): number {
 
 function fillEndsFp(setA: FpSet, setB: FpSet, t: number, out: Float32Array) {
   const p = state.p;
-  const log = state.layout === 'log';
   for (let x = 0; x < p; x++) {
     const si = x * 3;
     let ex = posTab[si];
@@ -1343,17 +1561,12 @@ function fillEndsFp(setA: FpSet, setB: FpSet, t: number, out: Float32Array) {
         if (t === 0 || y0 === y1) {
           ex = posTab[y0 * 3];
           ey = posTab[y0 * 3 + 1];
-        } else if (!log) {
-          const ay = lerpAngle(angle(y0, p), angle(y1, p), t);
-          ex = R * Math.cos(ay);
-          ey = R * Math.sin(ay);
-        } else if (y0 !== 0 && y1 !== 0) {
-          // on the log ring interpolation runs over exponents
-          const ay = lerpAngle(angle(dlogP[y0] - 1, p - 1), angle(dlogP[y1] - 1, p - 1), t);
+        } else if (onRim[y0] && onRim[y1]) {
+          const ay = lerpAngle(angTab[y0], angTab[y1], t);
           ex = R * Math.cos(ay);
           ey = R * Math.sin(ay);
         } else {
-          // an endpoint is the zero element (ring center): interpolate linearly
+          // an end is the element at the frame's infinity, drawn at the centre
           ex = posTab[y0 * 3] + (posTab[y1 * 3] - posTab[y0 * 3]) * t;
           ey = posTab[y0 * 3 + 1] + (posTab[y1 * 3 + 1] - posTab[y0 * 3 + 1]) * t;
         }
@@ -1371,8 +1584,6 @@ function fillEndsFp(setA: FpSet, setB: FpSet, t: number, out: Float32Array) {
 // to f2mobius; the test suite compares the two.
 function fillEndsFp2(setA: Fp2Set, setB: Fp2Set, t: number, out: Float32Array) {
   const p = state.p2;
-  const q1 = p * p - 1;
-  const log = state.layout === 'log';
   const inv = invTab;
   const pos = posTab;
   const anim = t > 0;
@@ -1435,29 +1646,13 @@ function fillEndsFp2(setA: Fp2Set, setB: Fp2Set, t: number, out: Float32Array) {
         ex = pos[wi];
         ey = pos[wi + 1];
         ez = pos[wi + 2];
-      } else if (!log) {
+      } else {
         const th = lerpAngle(tau * w0x, tau * w1x, t);
         const ph = lerpAngle(tau * w0y, tau * w1y, t);
         const rho = R_MAJ + R_MIN * Math.cos(ph);
         ex = rho * Math.cos(th);
         ey = rho * Math.sin(th);
         ez = R_MIN * Math.sin(ph);
-      } else {
-        const k0 = dlogTab[w0x * p + w0y];
-        const k1 = dlogTab[w1x * p + w1y];
-        if (k0 !== 0 && k1 !== 0) {
-          // on the log ring a ×g step is a uniform one-notch rotation
-          const ay = lerpAngle(angle(k0 - 1, q1), angle(k1 - 1, q1), t);
-          ex = R * Math.cos(ay);
-          ey = R * Math.sin(ay);
-          ez = 0;
-        } else {
-          const i0 = (w0x * p + w0y) * 3;
-          const i1 = (w1x * p + w1y) * 3;
-          ex = pos[i0] + (pos[i1] - pos[i0]) * t;
-          ey = pos[i0 + 1] + (pos[i1 + 1] - pos[i0 + 1]) * t;
-          ez = pos[i0 + 2] + (pos[i1 + 2] - pos[i0 + 2]) * t;
-        }
       }
       out[o] = ex;
       out[o + 1] = ey;
@@ -1471,6 +1666,7 @@ function rebuildScene() {
   const t = phase();
   const fade = state.phaseMode === 'fade' && t > 0;
   if (state.mode === 'fp') {
+    ensureFrame();
     const A = state.fp;
     const B = t > 0 ? nextSetFp() : A;
     if (fade) {
@@ -1496,9 +1692,537 @@ function rebuildScene() {
     gl.bindBuffer(gl.ARRAY_BUFFER, endBufB);
     gl.bufferSubData(gl.ARRAY_BUFFER, 0, endsB);
   }
+  if (state.showSrc) {
+    computeSources();
+    for (const set of [raysR, raysI, outR, outI]) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, set.bs);
+      gl.bufferData(gl.ARRAY_BUFFER, set.s.subarray(0, set.n * 3), gl.DYNAMIC_DRAW);
+      gl.bindBuffer(gl.ARRAY_BUFFER, set.be);
+      gl.bufferData(gl.ARRAY_BUFFER, set.e.subarray(0, set.n * 3), gl.DYNAMIC_DRAW);
+      gl.bindBuffer(gl.ARRAY_BUFFER, set.bc);
+      gl.bufferData(gl.ARRAY_BUFFER, set.c.subarray(0, set.n * 3), gl.DYNAMIC_DRAW);
+    }
+    gl.bindBuffer(gl.ARRAY_BUFFER, spBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, spData.subarray(0, (spCount + cuspCount) * 6), gl.DYNAMIC_DRAW);
+    if (gl2 && huyTex && huyCount > 0) {
+      gl2.activeTexture(gl2.TEXTURE0);
+      gl2.bindTexture(gl2.TEXTURE_2D, huyTex);
+      gl2.texImage2D(gl2.TEXTURE_2D, 0, gl2.RGBA32F, huyCount, 1, 0, gl2.RGBA, gl2.FLOAT, huyData.subarray(0, huyCount * 4));
+    }
+    if (panel.srcNote !== srcNote) panel.srcNote = srcNote;
+    if (panel.sceneOk !== sceneOk()) panel.sceneOk = sceneOk();
+  }
 }
 
-// ---------- drawing ----------
+// ---------- the eigen frame ----------
+// A projective map x ↦ (ax + b)/(cx + d) is not continuous in the value
+// layout, but it is conjugate to a multiplication or a rotation. With two
+// fixed points u, v in F_p the coordinate y = (x − u)/(x − v) makes it
+// y ↦ K·y; with one fixed point u, y = 1/(x − u) makes it y ↦ y + τ; with
+// fixed points in F_p² the coordinate y = (x − u)/(x − ū) has norm 1 and
+// the map is a rotation of the p + 1 norm-one elements. The eigen frame
+// lays the elements out by y — the element sent to ∞ sits at the centre —
+// and there the chords form a continuous family with a source curve.
+type EigenInfo =
+  | { type: 'hyperbolic'; u: number; v: number; K: number }
+  | { type: 'parabolic'; u: number; tau: number }
+  | { type: 'elliptic'; step: number; slots: number };
+let eigen: EigenInfo | null = null;
+let frameNote = '';
+let frameKey = '';
+let angTab = new Float32Array(0); // element angle in the current frame
+let onRim = new Uint8Array(0); // 0 for the element at the frame's infinity
+
+function sqrtMod(n: number, p: number): number | null {
+  n = mod(n, p);
+  for (let r = 0; r <= p >> 1; r++) if ((r * r) % p === n) return r;
+  return null;
+}
+
+// Fills eigen, angTab and onRim for the current fp map; null when the map
+// is affine (the value frame is already its own) or degenerate.
+function computeEigen(): EigenInfo | null {
+  const p = state.p;
+  const { a, b, c, d } = state.fp;
+  angTab = new Float32Array(p);
+  onRim = new Uint8Array(p);
+  if (c === 0) {
+    for (let x = 0; x < p; x++) {
+      angTab[x] = angle(x, p);
+      onRim[x] = 1;
+    }
+    frameNote = 'c = 0: the value frame is the map\'s own';
+    return null;
+  }
+  const inv2c = modInverse(mod(2 * c, p), p);
+  if (inv2c === null) return null;
+  const f = (x: number) => mobius(x, a, b, c, d, p);
+  const disc = mod((a - d) * (a - d) + 4 * b * c, p);
+  if (disc === 0) {
+    const u = mod((a - d) * inv2c, p);
+    const y = (x: number): number | null => (x === u ? null : modInverse(mod(x - u, p), p));
+    let tau = 0;
+    for (let x0 = 0; x0 < p; x0++) {
+      const y0 = y(x0);
+      const fx = f(x0);
+      if (y0 === null || fx === null) continue;
+      const y1 = y(fx);
+      if (y1 === null) continue;
+      tau = mod(y1 - y0, p);
+      break;
+    }
+    for (let x = 0; x < p; x++) {
+      const yx = y(x);
+      if (yx === null) continue;
+      angTab[x] = angle(yx, p);
+      onRim[x] = 1;
+    }
+    frameNote = `eigen: one fixed point ${u}; y = 1/(x − ${u}), the map is y ↦ y + ${tau}`;
+    return { type: 'parabolic', u, tau };
+  }
+  const r = sqrtMod(disc, p);
+  if (r !== null) {
+    const u = mod((a - d + r) * inv2c, p);
+    const v = mod((a - d - r) * inv2c, p);
+    const y = (x: number): number | null => (x === v ? null : mod((x - u) * modInverse(mod(x - v, p), p)!, p));
+    let K = 1;
+    for (let x0 = 0; x0 < p; x0++) {
+      const y0 = y(x0);
+      const fx = f(x0);
+      if (y0 === null || y0 === 0 || fx === null) continue;
+      const y1 = y(fx);
+      if (y1 === null) continue;
+      K = mod(y1 * modInverse(y0, p)!, p);
+      break;
+    }
+    for (let x = 0; x < p; x++) {
+      const yx = y(x);
+      if (yx === null) continue;
+      angTab[x] = angle(yx, p);
+      onRim[x] = 1;
+    }
+    frameNote = `eigen: fixed points ${u}, ${v}; y = (x − ${u})/(x − ${v}), the map is y ↦ ${K}·y`;
+    return { type: 'hyperbolic', u, v, K };
+  }
+  // elliptic: work in F_p(√disc), the fixed points are u and its conjugate
+  const D = disc;
+  const u0 = mod((a - d) * inv2c, p);
+  const u1 = inv2c;
+  const y = (x: number): F2 => {
+    // (x − u)/(x − ū) = (x − u)² / N(x − ū)
+    const w: F2 = [mod(x - u0, p), mod(-u1, p)];
+    const nrm = mod(w[0] * w[0] - D * w[1] * w[1], p);
+    const sq = f2mul(w, w, D, p);
+    const inv = modInverse(nrm, p)!;
+    return [mod(sq[0] * inv, p), mod(sq[1] * inv, p)];
+  };
+  // a generator of the norm-one group: w/w̄ = w²/N(w) has norm one
+  const slots = p + 1;
+  const factors = primeFactors(slots);
+  let g: F2 = [1, 0];
+  for (let t = 1; t < p; t++) {
+    const w: F2 = [1, t];
+    const nrm = mod(1 - D * t * t, p);
+    const inv = modInverse(nrm, p);
+    if (inv === null) continue;
+    const sq = f2mul(w, w, D, p);
+    const z: F2 = [mod(sq[0] * inv, p), mod(sq[1] * inv, p)];
+    if (factors.every((q) => { const e = f2pow(z, slots / q, D, p); return !(e[0] === 1 && e[1] === 0); })) {
+      g = z;
+      break;
+    }
+  }
+  const logs = new Map<number, number>();
+  let z: F2 = [1, 0];
+  for (let k = 0; k < slots; k++) {
+    logs.set(z[0] * p + z[1], k);
+    z = f2mul(z, g, D, p);
+  }
+  let step = 0;
+  for (let x0 = 0; x0 < p; x0++) {
+    const fx = f(x0);
+    if (fx === null) continue;
+    const k0 = logs.get(y(x0)[0] * p + y(x0)[1]);
+    const k1 = logs.get(y(fx)[0] * p + y(fx)[1]);
+    if (k0 === undefined || k1 === undefined) continue;
+    step = mod(k1 - k0, slots);
+    break;
+  }
+  for (let x = 0; x < p; x++) {
+    const yx = y(x);
+    const k = logs.get(yx[0] * p + yx[1]);
+    if (k === undefined) continue;
+    angTab[x] = angle(k, slots);
+    onRim[x] = 1;
+  }
+  frameNote = `eigen: fixed points in F_p²; the map is a rotation by ${step} of ${slots} slots`;
+  return { type: 'elliptic', step, slots };
+}
+
+function ensureFrame() {
+  const { a, b, c, d } = state.fp;
+  const key = `${state.frame}|${state.p}|${a},${b},${c},${d}`;
+  if (key === frameKey) return;
+  const wasEigen = frameKey.startsWith('eigen');
+  frameKey = key;
+  if (state.frame === 'eigen') {
+    eigen = computeEigen();
+    rebuildPoints();
+  } else {
+    eigen = null;
+    frameNote = '';
+    if (wasEigen) rebuildPoints();
+  }
+  panel.frameNote = frameNote;
+}
+
+// ---------- the optics scene ----------
+// What lights the mirror so that its reflections are the chords. The chord
+// leaving x with unit direction d is the reflection of a ray arriving along
+// u = d − 2(d·n)n, so the incoming lines are known exactly. For x ↦ a·x + b
+// on the circle they are the family θ → mθ, m = 2 − a, after the rotation
+// c0 that absorbs b; their envelope is the caustic of the incoming light
+// E(θ) = R/(m+1)·(m·e^{iθ} + e^{imθ}), with |m − 1| cusps where
+// e^{i(m−1)θ} = −1, at radius R·(m−1)/(m+1). The scene has nothing to do
+// with p: the mirror is sampled uniformly, the algebra only picks its p
+// chords out of the continuous family.
+//
+// The emitter is a wavefront of that light: W, the involute of E unwound
+// from an arc midpoint — a cycloid similar to E with the ratio
+// |m+1|/|m−1| and its cusps on the mirror. Every point of W radiates
+// along the normal of W, which is a tangent of E, and the mirror point ϑ
+// reflects that ray into the chord ϑ → aϑ + β. W lies inside the disk for
+// a ≥ 4, light runs from it straight to the mirror; for a ≤ 0 it lies
+// outside, light enters through the wall and touches E on the way. For
+// a = 2 the emitter is the point on the rim, for a = 3 the plane fronts
+// tangent to the mirror, the beam coming from both sides. In wave mode
+// each mirror element re-emits the incoming wave with the phase of its
+// path from the emitter.
+//
+// Drawn: the emitter (marks) and its light, before and after the mirror
+// in the same colour. The outer light, shown with the extensions switch,
+// is the ray before it enters through the wall and after it leaves, and,
+// for a caustic behind the mirror, the virtual continuation of the
+// incoming ray up to it. The caustic itself is not marked: it is where
+// the light gathers.
+let spData = new Float32Array(0); // source marks: the curve's points, then the point sources
+let spCount = 0;
+let cuspCount = 0;
+let srcNote = '';
+// Huygens elements: position ·2 and complex amplitude ·2 per lit element
+let huyData = new Float32Array(0);
+let huyCount = 0;
+let huyPower = 1; // Σ|c|² over the lit elements, the field's normalisation
+let huyX = new Float32Array(0);
+let huyY = new Float32Array(0);
+let huyRe = new Float32Array(0);
+let huyIm = new Float32Array(0);
+
+// One light, one colour: the emitter's marks and its rays share a teal;
+// the wave field is tinted by its wavelength instead (waveTint)
+const LIGHT_TINT: [number, number, number] = [0.55, 0.9, 0.85];
+const EMITTER_MARK = [0.45, 0.95, 0.85];
+
+// What the scene sees: an affine map y ↦ ar·y + br on a circle of `slots`
+// elements (small representatives: x ↦ (p−2)x is ×(−2)), or a rotation by
+// alpha, or nothing — a projective map in the value frame.
+type Affine = { ar: number; br: number; slots: number };
+
+// The scene exists for the maps x ↦ ax + b only: denominator 1
+const sceneOk = () => state.mode === 'fp' && state.fp.c === 0 && state.fp.d === 1;
+
+function sceneMap(): Affine {
+  const { a, b } = state.fp;
+  const p = state.p;
+  const small = (x: number, n: number) => (x > n / 2 ? x - n : x);
+  return { ar: small(a, p), br: small(b, p), slots: p };
+}
+
+// The source curve of y ↦ a·y + b: m, its cusp count, radius and rotation;
+// null when the curve degenerates.
+function sourceCurve(rp: Affine): { m: number; nc: number; rho: number; c0: number } | null {
+  const m = 2 - rp.ar;
+  if (m === 1 || m === -1) return null; // identity; parallel beam, curve at infinity
+  return { m, nc: Math.abs(m - 1), rho: (R * (m - 1)) / (m + 1), c0: (TAU * rp.br) / rp.slots / (m - 1) };
+}
+
+// standard frame (element 0 at angle 0, counterclockwise) → the panel's
+// frame (element 0 at the top, clockwise)
+const toPanel = (re: number, im: number): [number, number] => [im, re];
+// a mirror point at the standard angle ϑ, in the panel's frame
+const mirrorAt = (th: number): [number, number] => toPanel(R * Math.cos(th), R * Math.sin(th));
+
+function reserve(set: RaySet, rays: number) {
+  if (set.s.length >= rays * 3) return;
+  const grow = (a: Float32Array) => {
+    const b = new Float32Array(rays * 3);
+    b.set(a);
+    return b;
+  };
+  set.s = grow(set.s);
+  set.e = grow(set.e);
+  set.c = grow(set.c);
+}
+
+function ensureSourceArrays(rays: number, marks: number, elements: number) {
+  reserve(raysR, rays);
+  reserve(raysI, rays);
+  if (spData.length < marks * 6) spData = new Float32Array(marks * 6);
+  if (huyX.length < elements) {
+    huyX = new Float32Array(elements);
+    huyY = new Float32Array(elements);
+    huyRe = new Float32Array(elements);
+    huyIm = new Float32Array(elements);
+    huyData = new Float32Array(elements * 4);
+  }
+}
+
+function push(set: RaySet, sx: number, sy: number, ex: number, ey: number, tint: [number, number, number]) {
+  if (set.s.length < (set.n + 1) * 3) reserve(set, Math.max(1024, set.n * 2));
+  const o = set.n * 3;
+  set.s[o] = sx;
+  set.s[o + 1] = sy;
+  set.s[o + 2] = 0;
+  set.e[o] = ex;
+  set.e[o + 1] = ey;
+  set.e[o + 2] = 0;
+  set.c[o] = tint[0];
+  set.c[o + 1] = tint[1];
+  set.c[o + 2] = tint[2];
+  set.n++;
+}
+
+// distance from (x, y) along the unit direction (ux, uy) to the circle R_OUT
+function farOut(x: number, y: number, ux: number, uy: number) {
+  const pu = x * ux + y * uy;
+  return -pu + Math.sqrt(Math.max(pu * pu + R_OUT * R_OUT - x * x - y * y, 0));
+}
+
+// A reflected ray: the chord from the mirror point to its far end and, in
+// the outer light, its exit through the wall; `back` > 0 adds the ray's
+// virtual continuation behind the mirror point, towards the virtual image
+// the reflected light seems to come from.
+function pushReflected(px: number, py: number, ex: number, ey: number, tint: [number, number, number], back = 0) {
+  const dx = ex - px;
+  const dy = ey - py;
+  const len = Math.hypot(dx, dy);
+  if (len < 1e-9) return;
+  push(raysR, px, py, ex, ey, tint);
+  const t = farOut(ex, ey, dx / len, dy / len);
+  push(outR, ex, ey, ex + (dx / len) * t, ey + (dy / len) * t, tint);
+  if (back > 0) push(outR, px - (dx / len) * back, py - (dy / len) * back, px, py, tint);
+}
+
+// The light before the mirror point (px, py), arriving along the unit
+// direction (ux, uy). Light from a point source S inside the disk starts
+// at S; any other light enters through the wall at the chord's far end,
+// and the outer light shows it before the entry. `beyond` > 0 draws the
+// virtual continuation past the mirror point, towards a source behind it.
+function pushIncoming(px: number, py: number, ux: number, uy: number, from: [number, number] | null, beyond: number, origin?: [number, number]) {
+  if (from) {
+    push(raysI, from[0], from[1], px, py, LIGHT_TINT);
+  } else {
+    const s = 2 * (px * ux + py * uy);
+    const qx = px - ux * s;
+    const qy = py - uy * s;
+    push(raysI, qx, qy, px, py, LIGHT_TINT);
+    if (origin) push(outI, origin[0], origin[1], qx, qy, LIGHT_TINT);
+    else {
+      const t = farOut(qx, qy, -ux, -uy);
+      push(outI, qx - ux * t, qy - uy * t, qx, qy, LIGHT_TINT);
+    }
+  }
+  if (beyond > 0) push(outI, px, py, px + ux * beyond, py + uy * beyond, LIGHT_TINT);
+}
+
+function computeSources() {
+  const wave = state.waveOn;
+  const k = TAU / (state.wave * R);
+  // mirror samples: a quarter wavelength apart for the field, fixed for rays
+  let n = wave ? Math.min(HUY_MAX, Math.max(512, Math.ceil((8 * Math.PI) / state.wave))) : state.rays;
+  raysR.n = 0;
+  raysI.n = 0;
+  outR.n = 0;
+  outI.n = 0;
+  spCount = 0;
+  cuspCount = 0;
+  huyCount = 0;
+  if (!sceneOk()) {
+    srcNote = 'sources: the maps x ↦ ax + b only';
+    return;
+  }
+  const sm = sceneMap();
+  if (sm.ar === 1) {
+    srcNote = 'sources: identity map, no rays';
+    return;
+  }
+  frontSource(sm, n, wave, k);
+  if (wave) {
+    packHuygens(n);
+    // the mirror must be sampled closer than λ/2 or the array shows grating lobes
+    const lamMin = (4 * Math.PI) / n;
+    if (state.wave < lamMin) srcNote += `; λ < ${lamMin.toFixed(4)}: ${n} elements undersample the field`;
+  }
+  if (srcFit) {
+    srcFit = false;
+    fitSources();
+  }
+}
+
+function frontSource(rp: Affine, n: number, wave: boolean, k: number) {
+  const beta = (TAU * rp.br) / rp.slots;
+  const m = 2 - rp.ar;
+  const cv = sourceCurve(rp); // null for a = 3: the caustic is at infinity
+  const kind: 'point' | 'beam' | 'cycloid' = m === 0 ? 'point' : m === -1 ? 'beam' : 'cycloid';
+  const c0 = beta / (m - 1); // the rotation absorbing b
+  const cs = Math.cos(c0);
+  const sn = Math.sin(c0);
+  // E(ϑ) in the panel's frame
+  const curve = (ph: number): [number, number] => {
+    const re = (R / (m + 1)) * (m * Math.cos(ph) + Math.cos(m * ph));
+    const im = (R / (m + 1)) * (m * Math.sin(ph) + Math.sin(m * ph));
+    return toPanel(re * cs - im * sn, re * sn + im * cs);
+  };
+  // W(ϑ): E(ϑ) − σ·T(ϑ), σ the arc length of E from the midpoint of its arc,
+  // T its unit tangent; the involute with its cusps on the mirror
+  const frontAt = (ph: number): [number, number] => {
+    let psi = ((m - 1) * ph) / 2;
+    let c = Math.cos(psi);
+    if (Math.abs(c) < 1e-6) {
+      ph += 1e-5; // a cusp of E: step off it, both sides give the same point of W
+      psi = ((m - 1) * ph) / 2;
+      c = Math.cos(psi);
+    }
+    const kk = Math.round(psi / Math.PI);
+    const sigma = ((2 * R * Math.abs(m)) / Math.abs(m + 1)) * (2 / (m - 1)) * Math.sin(psi - kk * Math.PI);
+    const sg = Math.sign(m / (m + 1)) * Math.sign(c);
+    const ang = ((m + 1) * ph) / 2; // the unit tangent of E is sg·i·e^{i·ang}
+    const tx = -Math.sin(ang) * sg;
+    const ty = Math.cos(ang) * sg;
+    const re = (R / (m + 1)) * (m * Math.cos(ph) + Math.cos(m * ph)) - sigma * tx;
+    const im = (R / (m + 1)) * (m * Math.sin(ph) + Math.sin(m * ph)) - sigma * ty;
+    return toPanel(re * cs - im * sn, re * sn + im * cs);
+  };
+  ensureSourceArrays(n, kind === 'cycloid' ? 1024 : kind === 'point' ? 1 : 512, n);
+  const virtual = kind === 'cycloid' && !!cv && Math.abs(cv.rho) > R * 1.001; // the caustic lies behind the mirror
+  const rim = mirrorAt(-beta); // a = 2: the point on the rim, the element −b
+  // a = 3: the chords ϑ → −ϑ − β are parallel; the beam's direction from a generic one
+  let bx = 0;
+  let by = 0;
+  if (kind === 'beam') {
+    const [x0, y0] = mirrorAt(0.3);
+    const [x1, y1] = mirrorAt(-0.3 - beta);
+    const l = Math.hypot(x0 - x1, y0 - y1);
+    bx = (x0 - x1) / l;
+    by = (y0 - y1) / l;
+  }
+  for (let i = 0; i < n; i++) {
+    const th = (TAU * i) / n;
+    const [px, py] = mirrorAt(th);
+    const [ex, ey] = mirrorAt(rp.ar * th + beta);
+    // for a ≤ −2 the reflected rays diverge from a hypocycloid behind the
+    // mirror, the virtual image of the emitter: the outer light shows the
+    // ray's continuation back to it
+    let back = 0;
+    if (rp.ar <= -2) {
+      const a = rp.ar;
+      const ca = -beta / (a - 1);
+      const ph = th - ca;
+      const re = (R / (a + 1)) * (a * Math.cos(ph) + Math.cos(a * ph));
+      const im = (R / (a + 1)) * (a * Math.sin(ph) + Math.sin(a * ph));
+      const [tx, ty] = toPanel(re * Math.cos(ca) - im * Math.sin(ca), re * Math.sin(ca) + im * Math.cos(ca));
+      const l = Math.hypot(ex - px, ey - py);
+      if (l > 1e-9) back = ((px - tx) * (ex - px) + (py - ty) * (ey - py)) / l;
+    }
+    pushReflected(px, py, ex, ey, LIGHT_TINT, back);
+    huyX[i] = px;
+    huyY[i] = py;
+    huyRe[i] = 0;
+    huyIm[i] = 0;
+    // the incoming ray runs along the chord from mϑ − β to ϑ
+    const [qx, qy] = mirrorAt(m * th - beta);
+    const ql = Math.hypot(px - qx, py - qy);
+    if (ql < 1e-9) continue; // a fixed point: the chord degenerates
+    const ux = (px - qx) / ql;
+    const uy = (py - qy) / ql;
+    let path = 0; // the optical path from the emitter to this mirror point
+    if (kind === 'point') {
+      pushIncoming(px, py, ux, uy, rim, 0);
+      path = ql;
+    } else if (kind === 'beam') {
+      pushIncoming(px, py, ux, uy, null, 0);
+      path = px * ux + py * uy; // a plane wave: the path grows along its direction
+    } else {
+      const w = frontAt(th - c0);
+      let beyond = 0;
+      if (virtual) {
+        const [tx, ty] = curve(th - c0);
+        beyond = (tx - px) * ux + (ty - py) * uy;
+      }
+      // from W straight to the mirror when W is inside, through the wall otherwise
+      if (Math.hypot(w[0], w[1]) > R * (1 + 1e-6)) pushIncoming(px, py, ux, uy, null, beyond, w);
+      else pushIncoming(px, py, ux, uy, w, beyond);
+      path = Math.hypot(px - w[0], py - w[1]);
+    }
+    if (wave) {
+      huyRe[i] = Math.cos(k * path);
+      huyIm[i] = Math.sin(k * path);
+    }
+  }
+  // marks: the emitter
+  if (kind === 'cycloid') {
+    for (let i = 0; i < 1024; i++) {
+      const [x, y] = frontAt((TAU * (i + 0.5)) / 1024);
+      spData.set([x, y, 0, ...EMITTER_MARK], spCount * 6);
+      spCount++;
+    }
+  } else if (kind === 'beam') {
+    // the plane fronts tangent to the mirror where each beam enters
+    for (let side = -1; side <= 1; side += 2) {
+      for (let i = 0; i < 256; i++) {
+        const t = (-1.2 + (2.4 * (i + 0.5)) / 256) * R;
+        spData.set([-side * bx * R - by * t, -side * by * R + bx * t, 0, ...EMITTER_MARK], spCount * 6);
+        spCount++;
+      }
+    }
+  }
+  if (kind === 'point') {
+    spData.set([rim[0], rim[1], 0, ...EMITTER_MARK], (spCount + cuspCount) * 6);
+    cuspCount++;
+  }
+  if (kind === 'point') srcNote = 'the emitter is the point on the rim, the element −b';
+  else if (kind === 'beam') srcNote = 'a = 3: the emitter is at infinity, plane fronts from both sides';
+  else if (cv) {
+    const rho = Math.abs(cv.rho) / R;
+    const ratio = Math.abs(m + 1) / Math.abs(m - 1);
+    srcNote = `the emitter: the wavefront with its cusps on the mirror, a cycloid similar to the caustic (ratio ${ratio.toFixed(3)}), ${ratio < 1 ? 'inside' : 'outside'} the disk; the caustic: ${cv.nc} cusps at ${rho.toFixed(2)} R, light ${rho > 1.001 ? 'converges towards it' : 'diverges from it'}`;
+  }
+}
+
+function packHuygens(n: number) {
+  huyPower = 0;
+  for (let i = 0; i < n; i++) {
+    if (huyRe[i] === 0 && huyIm[i] === 0) continue;
+    huyData.set([huyX[i], huyY[i], huyRe[i], huyIm[i]], huyCount * 4);
+    huyPower += huyRe[i] * huyRe[i] + huyIm[i] * huyIm[i];
+    huyCount++;
+  }
+  if (huyPower <= 0) huyPower = 1;
+}
+
+// The source marks lie outside the circle for a ≥ 4 (the cusps at
+// R·(a−1)/(a−3)). When the sources are switched on or the map changes, the
+// view zooms out until they fit — never in.
+let srcFit = false;
+
+function fitSources() {
+  let maxR = 0;
+  const n = spCount + cuspCount;
+  for (let i = 0; i < n; i++) maxR = Math.max(maxR, Math.hypot(spData[i * 6], spData[i * 6 + 1]));
+  if (maxR <= 0) return;
+  const need = Math.min(1, 0.9 / maxR);
+  if (state.zoom > need) setZoom(need, true);
+}
 
 function resize() {
   const dpr = window.devicePixelRatio || 1;
@@ -1531,7 +2255,9 @@ function draw() {
   // instead and the linear-filtered tone-map pass box-downsamples.
   const ss = post && dpr < 1.5 ? 2 : 1;
   const usePost = ensureFbo(w * ss, h * ss);
-  const flat = state.mode === 'fp' || state.layout === 'log';
+  const flat = state.mode === 'fp';
+  const scaleX = (m / w) * state.zoom;
+  const scaleY = (m / h) * state.zoom;
 
   // Without the tone map the glow control falls back to scaling alpha.
   const alphaMul = usePost ? 1 : state.exposure;
@@ -1546,32 +2272,66 @@ function draw() {
     ? [[endBufA, 1 - t], [endBufB, t]]
     : [[endBufA, 1]];
 
+  // The wave field of the sources takes the half-size target; extensions
+  // then draw at full size into the main pass.
+  const huy = usePost && halfExt && !!gl2 && !!huyL && state.showSrc && state.waveOn && huyCount > 0 && flat;
+  if (huy && gl2 && huyL) {
+    gl2.bindFramebuffer(gl2.FRAMEBUFFER, extFbo);
+    gl.viewport(0, 0, extW, extH);
+    gl.disable(gl.BLEND);
+    gl.useProgram(huyL.prog);
+    gl2.activeTexture(gl2.TEXTURE0);
+    gl2.bindTexture(gl2.TEXTURE_2D, huyTex);
+    gl.uniform1i(huyL.el, 0);
+    gl.uniform1i(huyL.count, huyCount);
+    gl.uniform1f(huyL.invCount, 1 / huyCount);
+    gl.uniform1f(huyL.k, TAU / (state.wave * R));
+    gl.uniform1f(huyL.rMin, state.wave * R * 0.5);
+    gl.uniform1f(huyL.invR, 1 / R);
+    gl.uniform2f(huyL.scale, scaleX, scaleY);
+    gl.uniform2f(huyL.offset, offX, 0);
+    gl.uniform2f(huyL.size, extW, extH);
+    // an incoherent sum of the lit elements lands near 0.5 before the tone map
+    gl.uniform1f(huyL.norm, 0.5 / huyPower);
+    gl.uniform3fv(huyL.tint, waveTint(state.wave));
+    // only the quad's position attribute may stay enabled for this draw
+    gl.disableVertexAttribArray(locPos);
+    gl.disableVertexAttribArray(locColor);
+    gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+    gl.vertexAttribPointer(huyL.pos, 2, gl.FLOAT, false, 8, 0);
+    gl.enableVertexAttribArray(huyL.pos);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    gl.disableVertexAttribArray(huyL.pos);
+    gl.enable(gl.BLEND);
+  }
+
   // Chords and extensions draw instanced; the extension geometry comes out
   // of the vertex shader, so a fade pass only rebinds the end buffer.
-  gl.useProgram(lineProg);
-  gl.uniformMatrix3fv(locLRot, false, flat ? IDENT3 : rot);
-  gl.uniform2f(locLScale, (m / w) * state.zoom, (m / h) * state.zoom);
-  gl.uniform2f(locLOffset, offX, 0);
-  gl.uniform1f(locLDist, CAM_DIST);
-  gl.uniform1f(locLROut, R_OUT);
+  const L = lineL;
+  gl.useProgram(L.prog);
+  gl.uniformMatrix3fv(L.rot, false, flat ? IDENT3 : rot);
+  gl.uniform2f(L.scale, scaleX, scaleY);
+  gl.uniform2f(L.offset, offX, 0);
+  gl.uniform1f(L.dist, CAM_DIST);
+  gl.uniform1f(L.rOut, R_OUT);
   gl.bindBuffer(gl.ARRAY_BUFFER, roleBuf);
-  gl.vertexAttribPointer(locRole, 1, gl.FLOAT, false, 0, 0);
-  gl.enableVertexAttribArray(locRole);
+  gl.vertexAttribPointer(L.role, 1, gl.FLOAT, false, 0, 0);
+  gl.enableVertexAttribArray(L.role);
   gl.bindBuffer(gl.ARRAY_BUFFER, startBuf);
-  gl.vertexAttribPointer(locStart, 3, gl.FLOAT, false, 0, 0);
-  gl.enableVertexAttribArray(locStart);
-  setDivisor(locStart, 1);
+  gl.vertexAttribPointer(L.start, 3, gl.FLOAT, false, 0, 0);
+  gl.enableVertexAttribArray(L.start);
+  setDivisor(L.start, 1);
   gl.bindBuffer(gl.ARRAY_BUFFER, colorBuf);
-  gl.vertexAttribPointer(locColI, 3, gl.FLOAT, false, 0, 0);
-  gl.enableVertexAttribArray(locColI);
-  setDivisor(locColI, 1);
-  gl.enableVertexAttribArray(locEnd);
-  setDivisor(locEnd, 1);
+  gl.vertexAttribPointer(L.colI, 3, gl.FLOAT, false, 0, 0);
+  gl.enableVertexAttribArray(L.colI);
+  setDivisor(L.colI, 1);
+  gl.enableVertexAttribArray(L.end);
+  setDivisor(L.end, 1);
 
   // Extensions render into the half-size target. Its 1-px line is twice as
   // wide after the linear upsample, so the alpha is halved to keep the
   // accumulated brightness of the full-size line.
-  const extHalf = usePost && halfExt && state.showExt;
+  const extHalf = usePost && halfExt && state.showExt && state.showChords && !huy;
   if (extHalf && gl2) {
     gl2.bindFramebuffer(gl2.FRAMEBUFFER, extFbo);
     gl.viewport(0, 0, extW, extH);
@@ -1579,8 +2339,8 @@ function draw() {
     gl.clear(gl.COLOR_BUFFER_BIT);
     for (const [buf, weight] of passes) {
       gl.bindBuffer(gl.ARRAY_BUFFER, buf);
-      gl.vertexAttribPointer(locEnd, 3, gl.FLOAT, false, 0, 0);
-      gl.uniform1f(locLAlpha, chordAlpha * 0.45 * 0.5 * weight);
+      gl.vertexAttribPointer(L.end, 3, gl.FLOAT, false, 0, 0);
+      gl.uniform1f(L.alpha, chordAlpha * 0.45 * 0.5 * weight);
       drawInstanced(2, 4);
     }
   }
@@ -1597,28 +2357,55 @@ function draw() {
 
   for (const [buf, weight] of passes) {
     gl.bindBuffer(gl.ARRAY_BUFFER, buf);
-    gl.vertexAttribPointer(locEnd, 3, gl.FLOAT, false, 0, 0);
-    if (state.showExt && !extHalf) {
-      gl.uniform1f(locLAlpha, chordAlpha * 0.45 * weight);
+    gl.vertexAttribPointer(L.end, 3, gl.FLOAT, false, 0, 0);
+    if (state.showExt && !extHalf && state.showChords) {
+      gl.uniform1f(L.alpha, chordAlpha * 0.45 * weight);
       drawInstanced(2, 4);
     }
-    gl.uniform1f(locLAlpha, chordAlpha * weight);
-    drawInstanced(0, 2);
+    if (state.showChords) {
+      gl.uniform1f(L.alpha, chordAlpha * weight);
+      drawInstanced(0, 2);
+    }
+  }
+
+  if (state.showSrc && raysR.n + raysI.n > 0 && !huy) {
+    // the scene's rays: the same pipeline over its instance sets; the wave
+    // field replaces them when it is on
+    const drawSet = (set: RaySet, alpha: number) => {
+      if (set.n === 0) return;
+      gl.bindBuffer(gl.ARRAY_BUFFER, set.bs);
+      gl.vertexAttribPointer(L.start, 3, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ARRAY_BUFFER, set.be);
+      gl.vertexAttribPointer(L.end, 3, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ARRAY_BUFFER, set.bc);
+      gl.vertexAttribPointer(L.colI, 3, gl.FLOAT, false, 0, 0);
+      gl.uniform1f(L.alpha, alpha);
+      drawInstanced(0, 2, set.n);
+    };
+    // the scene has a fixed number of rays, so its brightness does not
+    // follow p the way the chords' does
+    const srcAlpha = 0.22 * alphaMul;
+    if (state.showExt) {
+      drawSet(outR, srcAlpha * 0.45);
+      if (state.showIn) drawSet(outI, srcAlpha * 0.45);
+    }
+    drawSet(raysR, srcAlpha);
+    if (state.showIn) drawSet(raysI, srcAlpha);
   }
 
   // restore non-instanced attribute state for the point and tone-map passes
-  setDivisor(locStart, 0);
-  setDivisor(locColI, 0);
-  setDivisor(locEnd, 0);
-  gl.disableVertexAttribArray(locRole);
-  gl.disableVertexAttribArray(locStart);
-  gl.disableVertexAttribArray(locColI);
-  gl.disableVertexAttribArray(locEnd);
+  setDivisor(L.start, 0);
+  setDivisor(L.colI, 0);
+  setDivisor(L.end, 0);
+  gl.disableVertexAttribArray(L.role);
+  gl.disableVertexAttribArray(L.start);
+  gl.disableVertexAttribArray(L.colI);
+  gl.disableVertexAttribArray(L.end);
   gl.enableVertexAttribArray(locPos);
   gl.enableVertexAttribArray(locColor);
   gl.useProgram(prog);
   gl.uniformMatrix3fv(locRot, false, flat ? IDENT3 : rot);
-  gl.uniform2f(locScale, (m / w) * state.zoom, (m / h) * state.zoom);
+  gl.uniform2f(locScale, scaleX, scaleY);
   gl.uniform2f(locOffset, offX, 0);
   gl.uniform1f(locDist, CAM_DIST);
   gl.uniform1f(locPoint, 0);
@@ -1644,28 +2431,57 @@ function draw() {
     gl.drawArrays(gl.POINTS, 0, pointCount);
   }
 
-  if (usePost && gl2 && tmProg) {
+  if (usePost && gl2 && tmL) {
+    const T = tmL;
     gl2.bindFramebuffer(gl2.FRAMEBUFFER, null);
     gl2.viewport(0, 0, w, h);
     gl2.disable(gl2.BLEND);
-    gl2.useProgram(tmProg);
+    gl2.useProgram(T.prog);
     gl2.activeTexture(gl2.TEXTURE1);
     gl2.bindTexture(gl2.TEXTURE_2D, extTex);
-    gl2.uniform1i(locTmExt, 1);
-    gl2.uniform1f(locTmExtOn, extHalf ? 1 : 0);
+    gl2.uniform1i(T.ext, 1);
+    gl2.uniform1f(T.extOn, extHalf || huy ? 1 : 0);
     gl2.activeTexture(gl2.TEXTURE0);
     gl2.bindTexture(gl2.TEXTURE_2D, fboTex);
-    gl2.uniform1i(locTmTex, 0);
-    gl2.uniform2f(locTmInv, 1 / w, 1 / h);
-    gl2.uniform1f(locTmExp, state.exposure);
-    gl2.uniform3f(locTmBg, 0.039, 0.047, 0.063);
+    gl2.uniform1i(T.tex, 0);
+    gl2.uniform2f(T.inv, 1 / w, 1 / h);
+    gl2.uniform1f(T.exp, state.exposure);
+    gl2.uniform3f(T.bg, 0.039, 0.047, 0.063);
     gl2.disableVertexAttribArray(locColor);
     gl2.bindBuffer(gl2.ARRAY_BUFFER, quadBuf);
-    gl2.vertexAttribPointer(locTmPos, 2, gl2.FLOAT, false, 8, 0);
-    gl2.enableVertexAttribArray(locTmPos);
+    gl2.vertexAttribPointer(T.pos, 2, gl2.FLOAT, false, 8, 0);
+    gl2.enableVertexAttribArray(T.pos);
     gl2.drawArrays(gl2.TRIANGLES, 0, 3);
     gl2.enable(gl2.BLEND);
     gl2.enableVertexAttribArray(locColor);
+  }
+
+  if (state.showSrc && spCount + cuspCount > 0) {
+    // the source marks go on top of the finished image, opaque, so that no
+    // haze of chords can hide them: the curve as small dots, the point
+    // sources as large ones
+    if (usePost && gl2) {
+      gl2.bindFramebuffer(gl2.FRAMEBUFFER, null);
+      gl.viewport(0, 0, w, h);
+    }
+    gl.useProgram(prog);
+    gl.uniformMatrix3fv(locRot, false, flat ? IDENT3 : rot);
+    gl.uniform2f(locScale, scaleX, scaleY);
+    gl.uniform2f(locOffset, offX, 0);
+    gl.uniform1f(locDist, CAM_DIST);
+    gl.uniform1f(locPoint, 1);
+    gl.uniform1f(locAlpha, 1);
+    gl.blendFunc(gl.ONE, gl.ZERO);
+    bindAttribs(spBuf);
+    if (spCount > 0) {
+      gl.uniform1f(locSize, 2.5 * dpr);
+      gl.drawArrays(gl.POINTS, 0, spCount);
+    }
+    if (cuspCount > 0) {
+      gl.uniform1f(locSize, 8 * dpr);
+      gl.drawArrays(gl.POINTS, spCount, cuspCount);
+    }
+    gl.blendFunc(gl.ONE, gl.ONE);
   }
 }
 
@@ -1673,9 +2489,26 @@ function draw() {
 
 let last = performance.now();
 
+// Frame time: the interval from a drawn frame to the next callback, which
+// grows with the GPU's back-pressure; averaged over a few frames and shown
+// in the panel a few times a second.
+let drawnAt = -1;
+let frameMs = 0;
+let fpsShownAt = 0;
+const fpsEl = document.getElementById('fps')!;
+
 function frame(now: number) {
   const dt = Math.min(0.1, (now - last) / 1000);
   last = now;
+  if (drawnAt >= 0) {
+    const sample = now - drawnAt;
+    frameMs = frameMs > 0 ? frameMs * 0.7 + sample * 0.3 : sample;
+    drawnAt = -1;
+    if (now - fpsShownAt > 250) {
+      fpsShownAt = now;
+      fpsEl.textContent = `${(1000 / frameMs).toFixed(frameMs > 100 ? 1 : 0)} fps · ${frameMs.toFixed(0)} ms`;
+    }
+  }
 
   if (state.playing && !stepBlocked()) {
     animValue += dt * state.speed;
@@ -1705,6 +2538,7 @@ function frame(now: number) {
   }
   if (needsDraw) {
     needsDraw = false;
+    drawnAt = now;
     draw();
   }
   requestAnimationFrame(frame);
@@ -1764,15 +2598,33 @@ function initFromQuery() {
     }
   }
   if (q.get('phase') === 'fade') state.phaseMode = 'fade';
-  if (q.get('layout') === 'log') state.layout = 'log';
+  if (q.get('frame') === 'eigen') state.frame = 'eigen';
   queryArm = q.get('arm');
+  if (q.get('chords') === '0') state.showChords = false;
   if (q.get('points') === '0') state.showPoints = false;
   if (q.get('ext') === '0') state.showExt = false;
+  if (q.get('in') === '0') state.showIn = false;
+  if (q.get('src') === '1') state.showSrc = true;
+  const rays = num('rays');
+  if (rays !== null) state.rays = Math.round(Math.min(8192, Math.max(64, rays)));
   const gl = num('glow');
   if (gl !== null) state.exposure = Math.min(2.5, Math.max(0.2, gl));
+  const wv = num('wave');
+  if (wv !== null && wv > 0 && state.showSrc) {
+    state.waveOn = true;
+    state.wave = Math.min(WAVE_MAX, Math.max(WAVE_MIN, wv));
+  }
   const zm = num('zoom');
   if (zm !== null) state.zoom = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, zm));
+  // the source marks may lie outside the frame: zoom out to them unless the
+  // address fixes the zoom itself
+  if (state.showSrc && zm === null) srcFit = true;
   if (q.get('play') === '1') state.playing = true;
+  if (state.mode !== 'fp') {
+    state.showSrc = false;
+    state.waveOn = false;
+    state.frame = 'value';
+  }
   const sp = num('speed');
   if (sp !== null && sp > 0) state.speed = Math.min(4, sp);
 }
@@ -1798,7 +2650,6 @@ if (
   dlogTab = buildDlog();
 }
 rootP = primitiveRoot(state.p);
-dlogP = buildDlogP();
 for (const k of ['a', 'b', 'c', 'd'] as const) state.T[k] = mod(state.T[k], curP());
 if (queryArm !== null && state.stepMode === 'coef') {
   const a = queryArm;
